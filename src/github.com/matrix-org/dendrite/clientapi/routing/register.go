@@ -318,8 +318,8 @@ func UserIDIsWithinApplicationServiceNamespace(
 	}
 
 	// Loop through all known application service's namespaces and see if any match
-	for _, knownAppservice := range cfg.Derived.ApplicationServices {
-		for _, namespace := range knownAppservice.NamespaceMap["users"] {
+	for _, knownAppService := range cfg.Derived.ApplicationServices {
+		for _, namespace := range knownAppService.NamespaceMap["users"] {
 			// AS namespaces are checked for validity in config
 			if namespace.RegexpObject.MatchString(userID) {
 				return true
@@ -338,16 +338,13 @@ func UsernameMatchesMultipleExclusiveNamespaces(
 	// Check namespaces and see if more than one match
 	matchCount := 0
 	for _, appservice := range cfg.Derived.ApplicationServices {
-		for _, namespaceSlice := range appservice.NamespaceMap {
-			for _, namespace := range namespaceSlice {
-				// Check if we have a match on this username
-				if namespace.RegexpObject.MatchString(username) {
-					matchCount++
-				}
+		if appservice.IsInterestedInUserID(username) {
+			if matchCount++; matchCount > 1 {
+				return true
 			}
 		}
 	}
-	return matchCount > 1
+	return false
 }
 
 // validateApplicationService checks if a provided application service token
