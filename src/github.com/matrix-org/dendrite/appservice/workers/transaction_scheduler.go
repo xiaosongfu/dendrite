@@ -80,7 +80,7 @@ func worker(db *storage.Database, as config.ApplicationService, ecm map[string]i
 			as.ID)
 	}
 
-	// Create an HTTP client for sending requests to app services
+	// Create a HTTP client for sending requests to app services
 	client := &http.Client{
 		Timeout: transactionTimeout,
 	}

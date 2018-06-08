@@ -15,14 +15,19 @@
 package appservice
 
 import (
+	"net/http"
+	"time"
+
+	appserviceAPI "github.com/matrix-org/dendrite/appservice/api"
 	"github.com/matrix-org/dendrite/appservice/consumers"
+	"github.com/matrix-org/dendrite/appservice/query"
 	"github.com/matrix-org/dendrite/appservice/routing"
 	"github.com/matrix-org/dendrite/appservice/storage"
 	"github.com/matrix-org/dendrite/appservice/workers"
 	"github.com/matrix-org/dendrite/clientapi/auth/storage/accounts"
 	"github.com/matrix-org/dendrite/common/basecomponent"
 	"github.com/matrix-org/dendrite/common/transactions"
-	"github.com/matrix-org/dendrite/roomserver/api"
+	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/sirupsen/logrus"
 )
@@ -33,10 +38,10 @@ func SetupAppServiceAPIComponent(
 	base *basecomponent.BaseDendrite,
 	accountsDB *accounts.Database,
 	federation *gomatrixserverlib.FederationClient,
-	aliasAPI api.RoomserverAliasAPI,
-	queryAPI api.RoomserverQueryAPI,
+	roomserverAliasAPI roomserverAPI.RoomserverAliasAPI,
+	roomserverQueryAPI roomserverAPI.RoomserverQueryAPI,
 	transactionsCache *transactions.Cache,
-) {
+) appserviceAPI.AppServiceQueryAPI {
 	// Create a connection to the appservice postgres DB
 	appserviceDB, err := storage.NewDatabase(string(base.Cfg.Database.AppService))
 	if err != nil {
@@ -52,9 +57,22 @@ func SetupAppServiceAPIComponent(
 	// appservice database.
 	eventCounterMap := make(map[string]int)
 
+	// Create a HTTP client that this component will use for all outbound and
+	// inbound requests (inbound only for the internal API)
+	httpClient := &http.Client{
+		Timeout: time.Second * 30,
+	}
+
+	appserviceQueryAPI := query.AppServiceQueryAPI{
+		HTTPClient: httpClient,
+		Cfg:        base.Cfg,
+	}
+
+	appserviceQueryAPI.SetupHTTP(http.DefaultServeMux)
+
 	consumer := consumers.NewOutputRoomEventConsumer(
 		base.Cfg, base.KafkaConsumer, accountsDB, appserviceDB,
-		queryAPI, aliasAPI, eventCounterMap,
+		roomserverQueryAPI, roomserverAliasAPI, eventCounterMap,
 	)
 	if err := consumer.Start(); err != nil {
 		logrus.WithError(err).Panicf("failed to start app service roomserver consumer")
@@ -67,7 +85,9 @@ func SetupAppServiceAPIComponent(
 
 	// Set up HTTP Endpoints
 	routing.Setup(
-		base.APIMux, *base.Cfg, queryAPI, aliasAPI, accountsDB,
-		federation, transactionsCache,
+		base.APIMux, *base.Cfg, roomserverQueryAPI, roomserverAliasAPI,
+		accountsDB, federation, transactionsCache,
 	)
+
+	return &appserviceQueryAPI
 }
