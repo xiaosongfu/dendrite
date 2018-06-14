@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strings"
 
+	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -67,6 +68,20 @@ func (a *ApplicationService) IsInterestedInRoomID(
 	}
 
 	return false
+}
+
+// IsInterestedInRoom checks to see if an application service is interested in a
+// room by seeing if any of the virtual users owned by the appservice is in the
+// room.
+func (a *ApplicationService) IsInterestedInRoom(
+	roomID string, rsAPI *roomserverAPI,
+) bool {
+	queryReq := rsAPI.QueryMembershipsForRoomRequest{
+		JoinedOnly: true,
+		RoomID: roomID,
+		Sender:
+	}
+	rsAPI.Query
 }
 
 // IsInterestedInUserID returns a bool on whether an application service's
