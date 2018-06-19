@@ -25,9 +25,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
-
-	"github.com/matrix-org/dendrite/common/config"
 
 	"github.com/matrix-org/dendrite/clientapi/auth"
 	"github.com/matrix-org/dendrite/clientapi/auth/authtypes"
@@ -36,6 +33,7 @@ import (
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
 	"github.com/matrix-org/dendrite/clientapi/userutil"
+	"github.com/matrix-org/dendrite/common/config"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
 	"github.com/prometheus/client_golang/prometheus"
@@ -109,18 +107,16 @@ type registerResponse struct {
 	DeviceID    string                       `json:"device_id"`
 }
 
-// recaptchaResponse represents the HTTP response from a Google Recaptcha server
-type recaptchaResponse struct {
-	Success     bool      `json:"success"`
-	ChallengeTS time.Time `json:"challenge_ts"`
-	Hostname    string    `json:"hostname"`
-	ErrorCodes  []int     `json:"error-codes"`
-}
-
 // validateUsername returns an error response if the username is invalid
 func validateUsername(username string) *util.JSONResponse {
 	// https://github.com/matrix-org/synapse/blob/v0.20.0/synapse/rest/client/v2_alpha/register.py#L161
-	if len(username) > maxUsernameLength {
+	// Don't allow numeric usernames less than MAX_INT64.
+	if _, err := strconv.ParseInt(username, 10, 64); err == nil {
+		return &util.JSONResponse{
+			Code: http.StatusBadRequest,
+			JSON: jsonerror.InvalidUsername("Numeric user IDs are reserved"),
+		}
+	} else if len(username) > maxUsernameLength {
 		return &util.JSONResponse{
 			Code: http.StatusBadRequest,
 			JSON: jsonerror.BadJSON(fmt.Sprintf("'username' >%d characters", maxUsernameLength)),
@@ -173,15 +169,13 @@ func validatePassword(password string) *util.JSONResponse {
 }
 
 // validateCredentials returns error if username or password is invalid
-func validateCredentials(username, password string) (jsonerr *util.JSONResponse) {
-	jsonerr = validateUserName(username)
-	if jsonerr != nil {
-		return
+func validateCredentials(username, password string) *util.JSONResponse {
+	if err := validateUsername(username); err != nil {
+		return err
 	}
 
-	jsonerr = validatePassword(password)
-	if jsonerr != nil {
-		return
+	if err := validatePassword(password); err != nil {
+		return err
 	}
 	return nil
 }
@@ -317,23 +311,6 @@ func Register(
 		sessionID = util.RandomString(sessionIDLength)
 	}
 
-	// Don't allow numeric usernames less than MAX_INT64.
-	if _, err := strconv.ParseInt(r.Username, 10, 64); err == nil {
-		return util.JSONResponse{
-			Code: http.StatusBadRequest,
-			JSON: jsonerror.InvalidUsername("Numeric user IDs are reserved"),
-		}
-	}
-	// Auto generate a numeric username if r.Username is empty
-	if r.Username == "" {
-		id, err := accountDB.GetNewNumericLocalpart(req.Context())
-		if err != nil {
-			return httputil.LogThenError(req, err)
-		}
-
-		r.Username = strconv.FormatInt(id, 10)
-	}
-
 	// If no auth type is specified by the client, send back the list of available flows
 	if r.Auth.Type == "" {
 		return util.JSONResponse{
@@ -348,6 +325,16 @@ func Register(
 
 	if resErr = validateCredentials(r.Username, r.Password); resErr != nil {
 		return *resErr
+	}
+
+	// Auto generate a numeric username if r.Username is empty
+	if r.Username == "" {
+		id, err := accountDB.GetNewNumericLocalpart(req.Context())
+		if err != nil {
+			return httputil.LogThenError(req, err)
+		}
+
+		r.Username = strconv.FormatInt(id, 10)
 	}
 
 	// Make sure normal user isn't registering under an exclusive application
@@ -394,7 +381,7 @@ func handleRegistrationFlow(
 		return util.MessageResponse(http.StatusForbidden, "Registration has been disabled")
 	}
 
-	var jsonRes *util.JSONResponse
+	var jsonError *util.JSONResponse
 	switch r.Auth.Type {
 	case authtypes.LoginTypeSharedSecret:
 		// Check shared secret against config
@@ -424,8 +411,8 @@ func handleRegistrationFlow(
 			r.Username, "", appserviceID, r.InitialDisplayName)
 
 	default:
-		jsonRes = HandleUserInteractiveFlow(req, r.UserInteractiveFlowRequest, sessionID, cfg, cfg.Derived.Registration)
-		if jsonRes == nil {
+		jsonError = HandleUserInteractiveFlow(req, r.UserInteractiveFlowRequest, sessionID, cfg, cfg.Derived.Registration)
+		if jsonError == nil {
 			return completeRegistration(
 				req.Context(),
 				accountDB,
@@ -436,7 +423,7 @@ func handleRegistrationFlow(
 				r.InitialDisplayName)
 		}
 	}
-	return *jsonRes
+	return *jsonError
 }
 
 // LegacyRegister process register requests from the legacy v1 API
