@@ -1,5 +1,4 @@
-// Copyright 2017 Vector Creations Ltd
-// Copyright 2017 New Vector Ltd
+// Copyright 2018 New Vector Ltd
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -166,11 +165,11 @@ func validateRecaptcha(
 }
 
 // HandleUserInteractiveFlow will direct and complete UIAA flow stages that the client has requested.
-// It accepts a pointer to http request, an interface of type UserInteractiveFlowRequest, config,
+// It accepts a pointer to a http request, an interface of type UserInteractiveFlowRequest, config,
 // sessionID and a list of required stages to complete the flow as config.UserInteractiveAuthConfig
 // and returns UserInteractiveResponse as specified in
 // https://matrix.org/docs/spec/client_server/r0.3.0.html#user-interactive-authentication-api
-// The function returns nil if authenticated successfully.
+// This function returns nil if authentication was successful.
 func HandleUserInteractiveFlow(
 	req *http.Request,
 	r UserInteractiveFlowRequest,

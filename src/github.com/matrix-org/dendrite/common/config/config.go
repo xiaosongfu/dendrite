@@ -241,8 +241,10 @@ type Dendrite struct {
 	} `yaml:"-"`
 }
 
-// UserInteractiveAuthConfig , configuration for user interactive Flow API. Contains sets of auth flows,
-// possible ways in which a client can authenticate via UIAA and params returned to the client for the same.
+// UserInteractiveAuthConfig is a configuration for user interactive Flow API.
+// It contains sets of auth flows, which represent the possible ways a client
+// can authenticate via User Interactive Authentication as well as any
+// parameters returned to the client during this process.
 // http://matrix.org/docs/spec/HEAD/client_server/r0.3.0.html#user-interactive-authentication-api
 type UserInteractiveAuthConfig struct {
 	// Flows is a slice of flows, which represent one possible way that the client can authenticate a request.
