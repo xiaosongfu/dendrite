@@ -21,6 +21,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/matrix-org/dendrite/appservice/types"
 	commonHTTP "github.com/matrix-org/dendrite/common/http"
 	opentracing "github.com/opentracing/opentracing-go"
 )
@@ -46,6 +47,29 @@ type RoomAliasExistsResponse struct {
 	AliasExists bool `json:"exists"`
 }
 
+// GetProtocolDefinitionRequest is a request to the appservice component asking
+// for the definition of a single third party protocol
+type GetProtocolDefinitionRequest struct {
+	ProtocolID string `json:"protocol_definition"`
+}
+
+// GetProtocolDefinitionResponse is a response providing a protocol definition
+// for the given protocol ID
+type GetProtocolDefinitionResponse struct {
+	ProtocolDefinition string `json:"protocol_definition"`
+}
+
+// GetAllProtocolDefinitionsRequest is a request to the appservice component
+// asking for what third party protocols are known and their definitions
+type GetAllProtocolDefinitionsRequest struct {
+}
+
+// GetAllProtocolDefinitionsResponse is a response containing all known third
+// party IDs and their definitions
+type GetAllProtocolDefinitionsResponse struct {
+	Protocols types.ThirdPartyProtocols `json:"protocols"`
+}
+
 // AppServiceQueryAPI is used to query user and room alias data from application
 // services
 type AppServiceQueryAPI interface {
@@ -56,10 +80,26 @@ type AppServiceQueryAPI interface {
 		response *RoomAliasExistsResponse,
 	) error
 	// TODO: QueryUserIDExists
+	GetProtocolDefinition(
+		ctx context.Context,
+		req *GetProtocolDefinitionRequest,
+		response *GetProtocolDefinitionResponse,
+	) error
+	GetAllProtocolDefinitions(
+		ctx context.Context,
+		req *GetAllProtocolDefinitionsRequest,
+		response *GetAllProtocolDefinitionsResponse,
+	) error
 }
 
-// AppServiceRoomAliasExistsPath is the HTTP path for the RoomAliasExists API
-const AppServiceRoomAliasExistsPath = "/api/appservice/RoomAliasExists"
+// RoomAliasExistsPath is the HTTP path for the RoomAliasExists API
+const RoomAliasExistsPath = "/api/appservice/RoomAliasExists"
+
+// GetProtocolDefinitionPath is the HTTP path for the GetProtocolDefinition API
+const GetProtocolDefinitionPath = "/api/appservice/GetProtocolDefinition"
+
+// GetAllProtocolDefinitionsPath is the HTTP path for the GetAllProtocolDefinitions API
+const GetAllProtocolDefinitionsPath = "/api/appservice/GetAllProtocolDefinitions"
 
 // httpAppServiceQueryAPI contains the URL to an appservice query API and a
 // reference to a httpClient used to reach it
@@ -90,6 +130,32 @@ func (h *httpAppServiceQueryAPI) RoomAliasExists(
 	span, ctx := opentracing.StartSpanFromContext(ctx, "appserviceRoomAliasExists")
 	defer span.Finish()
 
-	apiURL := h.appserviceURL + AppServiceRoomAliasExistsPath
+	apiURL := h.appserviceURL + RoomAliasExistsPath
+	return commonHTTP.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
+}
+
+// GetProtocolDefinition implements AppServiceQueryAPI
+func (h *httpAppServiceQueryAPI) GetProtocolDefinition(
+	ctx context.Context,
+	request *GetProtocolDefinitionRequest,
+	response *GetProtocolDefinitionResponse,
+) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "appserviceGetProtocolDefinition")
+	defer span.Finish()
+
+	apiURL := h.appserviceURL + GetProtocolDefinitionPath
+	return commonHTTP.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
+}
+
+// GetAllProtocolDefinitions implements AppServiceQueryAPI
+func (h *httpAppServiceQueryAPI) GetAllProtocolDefinitions(
+	ctx context.Context,
+	request *GetAllProtocolDefinitionsRequest,
+	response *GetAllProtocolDefinitionsResponse,
+) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "appserviceGetAllProtocolDefinitions")
+	defer span.Finish()
+
+	apiURL := h.appserviceURL + GetAllProtocolDefinitionsPath
 	return commonHTTP.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
 }

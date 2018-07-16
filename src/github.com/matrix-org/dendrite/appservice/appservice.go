@@ -15,6 +15,7 @@
 package appservice
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -31,7 +32,7 @@ import (
 	"github.com/matrix-org/dendrite/common/transactions"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/gomatrixserverlib"
-	"github.com/sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 )
 
 // SetupAppServiceAPIComponent sets up and registers HTTP handlers for the AppServices
@@ -47,7 +48,7 @@ func SetupAppServiceAPIComponent(
 	// Create a connection to the appservice postgres DB
 	appserviceDB, err := storage.NewDatabase(string(base.Cfg.Database.AppService))
 	if err != nil {
-		logrus.WithError(err).Panicf("failed to connect to appservice db")
+		log.WithError(err).Panicf("failed to connect to appservice db")
 	}
 
 	// Wrap application services in a type that relates the application service and
@@ -72,6 +73,7 @@ func SetupAppServiceAPIComponent(
 	appserviceQueryAPI := query.AppServiceQueryAPI{
 		HTTPClient: httpClient,
 		Cfg:        base.Cfg,
+		Db:         appserviceDB,
 	}
 
 	appserviceQueryAPI.SetupHTTP(http.DefaultServeMux)
@@ -81,13 +83,11 @@ func SetupAppServiceAPIComponent(
 		roomserverQueryAPI, roomserverAliasAPI, workerStates,
 	)
 	if err := consumer.Start(); err != nil {
-		logrus.WithError(err).Panicf("failed to start app service roomserver consumer")
+		log.WithError(err).Panicf("failed to start app service roomserver consumer")
 	}
 
-	// Create application service transaction workers
-	if err := workers.SetupTransactionWorkers(appserviceDB, workerStates); err != nil {
-		logrus.WithError(err).Panicf("failed to start app service transaction workers")
-	}
+	// Create application service transaction and third party workers
+	setupWorkers(appserviceDB, workerStates)
 
 	// Set up HTTP Endpoints
 	routing.Setup(
@@ -96,4 +96,30 @@ func SetupAppServiceAPIComponent(
 	)
 
 	return &appserviceQueryAPI
+}
+
+// setupWorkers creates worker goroutines that each interface with a connected
+// application service.
+func setupWorkers(
+	appserviceDB *storage.Database,
+	workerStates []types.ApplicationServiceWorkerState,
+) {
+	// Clear all old protocol definitions on startup
+	appserviceDB.ClearProtocolDefinitions(context.TODO())
+
+	// Create a worker that handles transmitting events to a single homeserver
+	for _, workerState := range workerStates {
+		log.WithFields(log.Fields{
+			"appservice": workerState.AppService.ID,
+		}).Info("starting application service")
+
+		// Don't create a worker if this AS doesn't want to receive events
+		if workerState.AppService.URL != "" {
+			// Worker to handle sending event transactions
+			go workers.TransactionWorker(appserviceDB, workerState)
+
+			// Worker to handle retreiving information about third parties
+			go workers.ThirdPartyWorker(appserviceDB, workerState.AppService)
+		}
+	}
 }

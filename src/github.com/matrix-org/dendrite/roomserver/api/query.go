@@ -372,7 +372,7 @@ func (h *httpRoomserverQueryAPI) QueryMembershipForUser(
 	defer span.Finish()
 
 	apiURL := h.roomserverURL + RoomserverQueryMembershipForUserPath
-	return postJSON(ctx, span, h.httpClient, apiURL, request, response)
+	return commonHTTP.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
 }
 
 // QueryMembershipsForRoom implements RoomserverQueryAPI
