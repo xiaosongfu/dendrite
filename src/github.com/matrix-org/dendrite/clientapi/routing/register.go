@@ -337,8 +337,9 @@ func UsernameMatchesMultipleExclusiveNamespaces(
 ) bool {
 	// Check namespaces and see if more than one match
 	matchCount := 0
+	userID := userutil.MakeUserID(username, cfg.Matrix.ServerName)
 	for _, appservice := range cfg.Derived.ApplicationServices {
-		if appservice.IsInterestedInUserID(username) {
+		if appservice.IsInterestedInUserID(userID) {
 			if matchCount++; matchCount > 1 {
 				return true
 			}
