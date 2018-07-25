@@ -203,7 +203,7 @@ func extractAccessToken(req *http.Request) (string, error) {
 		if len(parts) != 2 || parts[0] != "Bearer" {
 			return "", fmt.Errorf("invalid Authorization header")
 		}
-		return parts[1], nil
+		return strings.Trim(parts[1], " "), nil
 	}
 
 	return "", fmt.Errorf("missing access token")
