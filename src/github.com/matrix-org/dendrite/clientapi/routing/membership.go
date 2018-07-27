@@ -19,6 +19,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/matrix-org/dendrite/appservice"
 	"github.com/matrix-org/dendrite/clientapi/auth/authtypes"
 	"github.com/matrix-org/dendrite/clientapi/auth/storage/accounts"
 	"github.com/matrix-org/dendrite/clientapi/httputil"
@@ -147,7 +148,8 @@ func buildMembershipEvent(
 		return nil, err
 	}
 
-	return common.BuildEvent(req, &builder, cfg, queryAPI, nil)
+	eventTime := appservice.ParseTSParam(r.req)
+	return common.BuildEvent(req.Context(), eventTime, &builder, cfg, queryAPI, nil)
 }
 
 // loadProfile lookups the profile of a given user from the database and returns

@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"net/http"
 
+	"github.com/matrix-org/dendrite/appservice"
 	"github.com/matrix-org/dendrite/clientapi/auth/authtypes"
 	"github.com/matrix-org/dendrite/clientapi/auth/storage/accounts"
 	"github.com/matrix-org/dendrite/clientapi/httputil"
@@ -284,7 +285,8 @@ func buildMembershipEvents(
 			return nil, err
 		}
 
-		event, err := common.BuildEvent(req, &builder, *cfg, queryAPI, nil)
+		eventTime := appservice.ParseTSParam(req)
+		event, err := common.BuildEvent(req.Context(), eventTime, &builder, *cfg, queryAPI, nil)
 		if err != nil {
 			return nil, err
 		}

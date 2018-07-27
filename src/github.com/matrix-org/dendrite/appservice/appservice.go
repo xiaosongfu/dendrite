@@ -17,6 +17,7 @@ package appservice
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -131,4 +132,23 @@ func generateAppServiceAccount(
 	// Create a dummy device with a dummy token for the application service
 	_, err = deviceDB.CreateDevice(ctx, as.SenderLocalpart, nil, as.ASToken, &as.SenderLocalpart)
 	return err
+}
+
+// ParseTSParam takes a req from an application service and parses a Time object
+// from the req if it exists in the query parameters. If it doesn't exist, the
+// current time is returned.
+func ParseTSParam(req *http.Request) time.Time {
+	// Use the ts parameter's value for event time if present
+	tsStr := req.URL.Query().Get("ts")
+	if tsStr == "" {
+		return time.Now()
+	}
+
+	// The parameter exists, parse into a Time object
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return time.Unix(ts/1000, 0)
+	}
+
+	return time.Unix(ts/1000, 0)
 }
