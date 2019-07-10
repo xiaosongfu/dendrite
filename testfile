@@ -143,3 +143,4 @@ Events come down the correct room
 local user can join room with version 5
 User can invite local user to room with version 5
 Inbound federation can receive room-join requests
+Can get rooms/{roomId}/state for a departed room (SPEC-216)
