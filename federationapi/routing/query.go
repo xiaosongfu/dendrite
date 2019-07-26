@@ -62,7 +62,7 @@ func RoomAliasToID(
 			// TODO: List servers that are aware of this room alias
 			resp = gomatrixserverlib.RespDirectory{
 				RoomID:  queryRes.RoomID,
-				Servers: []gomatrixserverlib.ServerName{},
+				Servers: []gomatrixserverlib.ServerName{cfg.Matrix.ServerName},
 			}
 		} else {
 			// If no alias was found, return an error
