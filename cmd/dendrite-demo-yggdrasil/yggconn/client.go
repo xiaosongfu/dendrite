@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/matrix-org/dendrite/internal/setup"
+	"github.com/matrix-org/dendrite/setup"
 	"github.com/matrix-org/gomatrixserverlib"
 )
 
@@ -33,7 +33,9 @@ func (n *Node) CreateClient(
 			},
 		},
 	)
-	return gomatrixserverlib.NewClientWithTransport(true, tr)
+	return gomatrixserverlib.NewClient(
+		gomatrixserverlib.WithTransport(tr),
+	)
 }
 
 func (n *Node) CreateFederationClient(
@@ -49,12 +51,12 @@ func (n *Node) CreateFederationClient(
 				ResponseHeaderTimeout: 10 * time.Second,
 				IdleConnTimeout:       30 * time.Second,
 				DialContext:           n.DialerContext,
-				TLSClientConfig:       n.tlsConfig,
 			},
 		},
 	)
-	return gomatrixserverlib.NewFederationClientWithTransport(
+	return gomatrixserverlib.NewFederationClient(
 		base.Cfg.Global.ServerName, base.Cfg.Global.KeyID,
-		base.Cfg.Global.PrivateKey, true, tr,
+		base.Cfg.Global.PrivateKey,
+		gomatrixserverlib.WithTransport(tr),
 	)
 }

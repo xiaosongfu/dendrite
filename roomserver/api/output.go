@@ -24,6 +24,8 @@ type OutputType string
 const (
 	// OutputTypeNewRoomEvent indicates that the event is an OutputNewRoomEvent
 	OutputTypeNewRoomEvent OutputType = "new_room_event"
+	// OutputTypeOldRoomEvent indicates that the event is an OutputOldRoomEvent
+	OutputTypeOldRoomEvent OutputType = "old_room_event"
 	// OutputTypeNewInviteEvent indicates that the event is an OutputNewInviteEvent
 	OutputTypeNewInviteEvent OutputType = "new_invite_event"
 	// OutputTypeRetireInviteEvent indicates that the event is an OutputRetireInviteEvent
@@ -49,6 +51,10 @@ const (
 
 	// OutputTypeNewPeek indicates that the kafka event is an OutputNewPeek
 	OutputTypeNewPeek OutputType = "new_peek"
+	// OutputTypeNewInboundPeek indicates that the kafka event is an OutputNewInboundPeek
+	OutputTypeNewInboundPeek OutputType = "new_inbound_peek"
+	// OutputTypeRetirePeek indicates that the kafka event is an OutputRetirePeek
+	OutputTypeRetirePeek OutputType = "retire_peek"
 )
 
 // An OutputEvent is an entry in the roomserver output kafka log.
@@ -58,6 +64,8 @@ type OutputEvent struct {
 	Type OutputType `json:"type"`
 	// The content of event with type OutputTypeNewRoomEvent
 	NewRoomEvent *OutputNewRoomEvent `json:"new_room_event,omitempty"`
+	// The content of event with type OutputTypeOldRoomEvent
+	OldRoomEvent *OutputOldRoomEvent `json:"old_room_event,omitempty"`
 	// The content of event with type OutputTypeNewInviteEvent
 	NewInviteEvent *OutputNewInviteEvent `json:"new_invite_event,omitempty"`
 	// The content of event with type OutputTypeRetireInviteEvent
@@ -66,6 +74,10 @@ type OutputEvent struct {
 	RedactedEvent *OutputRedactedEvent `json:"redacted_event,omitempty"`
 	// The content of event with type OutputTypeNewPeek
 	NewPeek *OutputNewPeek `json:"new_peek,omitempty"`
+	// The content of event with type OutputTypeNewInboundPeek
+	NewInboundPeek *OutputNewInboundPeek `json:"new_inbound_peek,omitempty"`
+	// The content of event with type OutputTypeRetirePeek
+	RetirePeek *OutputRetirePeek `json:"retire_peek,omitempty"`
 }
 
 // Type of the OutputNewRoomEvent.
@@ -90,7 +102,7 @@ const (
 // prev_events.
 type OutputNewRoomEvent struct {
 	// The Event.
-	Event gomatrixserverlib.HeaderedEvent `json:"event"`
+	Event *gomatrixserverlib.HeaderedEvent `json:"event"`
 	// Does the event completely rewrite the room state? If so, then AddsStateEventIDs
 	// will contain the entire room state.
 	RewritesState bool `json:"rewrites_state"`
@@ -107,7 +119,7 @@ type OutputNewRoomEvent struct {
 	// may decide a bunch of state events on one branch are now valid, so they will be
 	// present in this list. This is useful when trying to maintain the current state of a room
 	// as to do so you need to include both these events and `Event`.
-	AddStateEvents []gomatrixserverlib.HeaderedEvent `json:"adds_state_events"`
+	AddStateEvents []*gomatrixserverlib.HeaderedEvent `json:"adds_state_events"`
 
 	// The state event IDs that were removed from the state of the room by this event.
 	RemovesStateEventIDs []string `json:"removes_state_event_ids"`
@@ -164,7 +176,7 @@ type OutputNewRoomEvent struct {
 // the original event to save space, so you cannot use that slice alone.
 // Instead, use this function which will add the original event if it is present
 // in `AddsStateEventIDs`.
-func (ore *OutputNewRoomEvent) AddsState() []gomatrixserverlib.HeaderedEvent {
+func (ore *OutputNewRoomEvent) AddsState() []*gomatrixserverlib.HeaderedEvent {
 	includeOutputEvent := false
 	for _, id := range ore.AddsStateEventIDs {
 		if id == ore.Event.EventID() {
@@ -178,6 +190,20 @@ func (ore *OutputNewRoomEvent) AddsState() []gomatrixserverlib.HeaderedEvent {
 	return append(ore.AddStateEvents, ore.Event)
 }
 
+// An OutputOldRoomEvent is written when the roomserver receives an old event.
+// This will typically happen as a result of getting either missing events
+// or backfilling. Downstream components may wish to send these events to
+// clients when it is advantageous to do so, but with the consideration that
+// the event is likely a historic event.
+//
+// Old events do not update forward extremities or the current room state,
+// therefore they must not be treated as if they do. Downstream components
+// should build their current room state up from OutputNewRoomEvents only.
+type OutputOldRoomEvent struct {
+	// The Event.
+	Event *gomatrixserverlib.HeaderedEvent `json:"event"`
+}
+
 // An OutputNewInviteEvent is written whenever an invite becomes active.
 // Invite events can be received outside of an existing room so have to be
 // tracked separately from the room events themselves.
@@ -185,7 +211,7 @@ type OutputNewInviteEvent struct {
 	// The room version of the invited room.
 	RoomVersion gomatrixserverlib.RoomVersion `json:"room_version"`
 	// The "m.room.member" invite event.
-	Event gomatrixserverlib.HeaderedEvent `json:"event"`
+	Event *gomatrixserverlib.HeaderedEvent `json:"event"`
 }
 
 // An OutputRetireInviteEvent is written whenever an existing invite is no longer
@@ -212,12 +238,32 @@ type OutputRedactedEvent struct {
 	// The event ID that was redacted
 	RedactedEventID string
 	// The value of `unsigned.redacted_because` - the redaction event itself
-	RedactedBecause gomatrixserverlib.HeaderedEvent
+	RedactedBecause *gomatrixserverlib.HeaderedEvent
 }
 
 // An OutputNewPeek is written whenever a user starts peeking into a room
 // using a given device.
 type OutputNewPeek struct {
+	RoomID   string
+	UserID   string
+	DeviceID string
+}
+
+// An OutputNewInboundPeek is written whenever a server starts peeking into a room
+type OutputNewInboundPeek struct {
+	RoomID string
+	PeekID string
+	// the event ID at which the peek begins (so we can avoid
+	// a race between tracking the state returned by /peek and emitting subsequent
+	// peeked events)
+	LatestEventID string
+	ServerName    gomatrixserverlib.ServerName
+	// how often we told the peeking server to renew the peek
+	RenewalInterval int64
+}
+
+// An OutputRetirePeek is written whenever a user stops peeking into a room.
+type OutputRetirePeek struct {
 	RoomID   string
 	UserID   string
 	DeviceID string

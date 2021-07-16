@@ -21,8 +21,8 @@ import (
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
-	"github.com/matrix-org/dendrite/internal/config"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/dendrite/userapi/api"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/gomatrixserverlib"
@@ -61,9 +61,12 @@ func DirectoryRoom(
 	var res roomDirectoryResponse
 
 	// Query the roomserver API to check if the alias exists locally.
-	queryReq := roomserverAPI.GetRoomIDForAliasRequest{Alias: roomAlias}
-	var queryRes roomserverAPI.GetRoomIDForAliasResponse
-	if err = rsAPI.GetRoomIDForAlias(req.Context(), &queryReq, &queryRes); err != nil {
+	queryReq := &roomserverAPI.GetRoomIDForAliasRequest{
+		Alias:              roomAlias,
+		IncludeAppservices: true,
+	}
+	queryRes := &roomserverAPI.GetRoomIDForAliasResponse{}
+	if err = rsAPI.GetRoomIDForAlias(req.Context(), queryReq, queryRes); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("rsAPI.GetRoomIDForAlias failed")
 		return jsonerror.InternalServerError()
 	}

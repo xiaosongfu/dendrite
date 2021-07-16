@@ -21,15 +21,14 @@ import (
 	"time"
 
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/eventutil"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
 )
 
 // MakeJoin implements the /make_join API
-// nolint:gocyclo
 func MakeJoin(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
@@ -138,7 +137,7 @@ func MakeJoin(
 	// Check that the join is allowed or not
 	stateEvents := make([]*gomatrixserverlib.Event, len(queryRes.StateEvents))
 	for i := range queryRes.StateEvents {
-		stateEvents[i] = &queryRes.StateEvents[i].Event
+		stateEvents[i] = queryRes.StateEvents[i].Event
 	}
 
 	provider := gomatrixserverlib.NewAuthEvents(stateEvents)
@@ -161,7 +160,6 @@ func MakeJoin(
 // SendJoin implements the /send_join API
 // The make-join send-join dance makes much more sense as a single
 // flow so the cyclomatic complexity is high:
-// nolint:gocyclo
 func SendJoin(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
@@ -273,14 +271,24 @@ func SendJoin(
 
 	// Check if the user is already in the room. If they're already in then
 	// there isn't much point in sending another join event into the room.
+	// Also check to see if they are banned: if they are then we reject them.
 	alreadyJoined := false
+	isBanned := false
 	for _, se := range stateAndAuthChainResponse.StateEvents {
 		if !se.StateKeyEquals(*event.StateKey()) {
 			continue
 		}
 		if membership, merr := se.Membership(); merr == nil {
 			alreadyJoined = (membership == gomatrixserverlib.Join)
+			isBanned = (membership == gomatrixserverlib.Ban)
 			break
+		}
+	}
+
+	if isBanned {
+		return util.JSONResponse{
+			Code: http.StatusForbidden,
+			JSON: jsonerror.Forbidden("user is banned"),
 		}
 	}
 
@@ -290,7 +298,8 @@ func SendJoin(
 	if !alreadyJoined {
 		if err = api.SendEvents(
 			httpReq.Context(), rsAPI,
-			[]gomatrixserverlib.HeaderedEvent{
+			api.KindNew,
+			[]*gomatrixserverlib.HeaderedEvent{
 				event.Headered(stateAndAuthChainResponse.RoomVersion),
 			},
 			cfg.Matrix.ServerName,
@@ -318,7 +327,7 @@ func SendJoin(
 	}
 }
 
-type eventsByDepth []gomatrixserverlib.HeaderedEvent
+type eventsByDepth []*gomatrixserverlib.HeaderedEvent
 
 func (e eventsByDepth) Len() int {
 	return len(e)

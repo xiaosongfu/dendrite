@@ -17,8 +17,10 @@
 package input
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/matrix-org/dendrite/internal/eventutil"
 	"github.com/matrix-org/dendrite/roomserver/api"
@@ -26,7 +28,28 @@ import (
 	"github.com/matrix-org/dendrite/roomserver/state"
 	"github.com/matrix-org/dendrite/roomserver/types"
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/matrix-org/util"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+)
+
+func init() {
+	prometheus.MustRegister(processRoomEventDuration)
+}
+
+var processRoomEventDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Namespace: "dendrite",
+		Subsystem: "roomserver",
+		Name:      "processroomevent_duration_millis",
+		Help:      "How long it takes the roomserver to process an event",
+		Buckets: []float64{ // milliseconds
+			5, 10, 25, 50, 75, 100, 250, 500,
+			1000, 2000, 3000, 4000, 5000, 6000,
+			7000, 8000, 9000, 10000, 15000, 20000,
+		},
+	},
+	[]string{"room_id"},
 )
 
 // processRoomEvent can only be called once at a time
@@ -40,9 +63,40 @@ func (r *Inputer) processRoomEvent(
 	ctx context.Context,
 	input *api.InputRoomEvent,
 ) (eventID string, err error) {
+	// Measure how long it takes to process this event.
+	started := time.Now()
+	defer func() {
+		timetaken := time.Since(started)
+		processRoomEventDuration.With(prometheus.Labels{
+			"room_id": input.Event.RoomID(),
+		}).Observe(float64(timetaken.Milliseconds()))
+	}()
+
 	// Parse and validate the event JSON
 	headered := input.Event
 	event := headered.Unwrap()
+
+	// if we have already got this event then do not process it again, if the input kind is an outlier.
+	// Outliers contain no extra information which may warrant a re-processing.
+	if input.Kind == api.KindOutlier {
+		evs, err2 := r.DB.EventsFromIDs(ctx, []string{event.EventID()})
+		if err2 == nil && len(evs) == 1 {
+			// check hash matches if we're on early room versions where the event ID was a random string
+			idFormat, err2 := headered.RoomVersion.EventIDFormat()
+			if err2 == nil {
+				switch idFormat {
+				case gomatrixserverlib.EventIDFormatV1:
+					if bytes.Equal(event.EventReference().EventSHA256, evs[0].EventReference().EventSHA256) {
+						util.GetLogger(ctx).WithField("event_id", event.EventID()).Infof("Already processed event; ignoring")
+						return event.EventID(), nil
+					}
+				default:
+					util.GetLogger(ctx).WithField("event_id", event.EventID()).Infof("Already processed event; ignoring")
+					return event.EventID(), nil
+				}
+			}
+		}
+	}
 
 	// Check that the event passes authentication checks and work out
 	// the numeric IDs for the auth events.
@@ -87,11 +141,11 @@ func (r *Inputer) processRoomEvent(
 
 	// if storing this event results in it being redacted then do so.
 	if !isRejected && redactedEventID == event.EventID() {
-		r, rerr := eventutil.RedactEvent(redactionEvent, &event)
+		r, rerr := eventutil.RedactEvent(redactionEvent, event)
 		if rerr != nil {
 			return "", fmt.Errorf("eventutil.RedactEvent: %w", rerr)
 		}
-		event = *r
+		event = r
 	}
 
 	// For outliers we can stop after we've stored the event itself as it
@@ -119,7 +173,7 @@ func (r *Inputer) processRoomEvent(
 		// We haven't calculated a state for this event yet.
 		// Lets calculate one.
 		err = r.calculateAndSetState(ctx, input, *roomInfo, &stateAtEvent, event, isRejected)
-		if err != nil {
+		if err != nil && input.Kind != api.KindOld {
 			return "", fmt.Errorf("r.calculateAndSetState: %w", err)
 		}
 	}
@@ -136,16 +190,31 @@ func (r *Inputer) processRoomEvent(
 		return event.EventID(), rejectionErr
 	}
 
-	if err = r.updateLatestEvents(
-		ctx,                 // context
-		roomInfo,            // room info for the room being updated
-		stateAtEvent,        // state at event (below)
-		event,               // event
-		input.SendAsServer,  // send as server
-		input.TransactionID, // transaction ID
-		input.HasState,      // rewrites state?
-	); err != nil {
-		return "", fmt.Errorf("r.updateLatestEvents: %w", err)
+	switch input.Kind {
+	case api.KindNew:
+		if err = r.updateLatestEvents(
+			ctx,                 // context
+			roomInfo,            // room info for the room being updated
+			stateAtEvent,        // state at event (below)
+			event,               // event
+			input.SendAsServer,  // send as server
+			input.TransactionID, // transaction ID
+			input.HasState,      // rewrites state?
+		); err != nil {
+			return "", fmt.Errorf("r.updateLatestEvents: %w", err)
+		}
+	case api.KindOld:
+		err = r.WriteOutputEvents(event.RoomID(), []api.OutputEvent{
+			{
+				Type: api.OutputTypeOldRoomEvent,
+				OldRoomEvent: &api.OutputOldRoomEvent{
+					Event: headered,
+				},
+			},
+		})
+		if err != nil {
+			return "", fmt.Errorf("r.WriteOutputEvents (old): %w", err)
+		}
 	}
 
 	// processing this event resulted in an event (which may not be the one we're processing)
@@ -163,7 +232,7 @@ func (r *Inputer) processRoomEvent(
 			},
 		})
 		if err != nil {
-			return "", fmt.Errorf("r.WriteOutputEvents: %w", err)
+			return "", fmt.Errorf("r.WriteOutputEvents (redactions): %w", err)
 		}
 	}
 
@@ -176,7 +245,7 @@ func (r *Inputer) calculateAndSetState(
 	input *api.InputRoomEvent,
 	roomInfo types.RoomInfo,
 	stateAtEvent *types.StateAtEvent,
-	event gomatrixserverlib.Event,
+	event *gomatrixserverlib.Event,
 	isRejected bool,
 ) error {
 	var err error

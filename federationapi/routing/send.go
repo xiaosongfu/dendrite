@@ -17,6 +17,7 @@ package routing
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -24,13 +25,130 @@ import (
 
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
 	eduserverAPI "github.com/matrix-org/dendrite/eduserver/api"
-	"github.com/matrix-org/dendrite/internal/config"
+	federationAPI "github.com/matrix-org/dendrite/federationapi/api"
+	"github.com/matrix-org/dendrite/internal"
 	keyapi "github.com/matrix-org/dendrite/keyserver/api"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+	"go.uber.org/atomic"
 )
+
+const (
+	// Event was passed to the roomserver
+	MetricsOutcomeOK = "ok"
+	// Event failed to be processed
+	MetricsOutcomeFail = "fail"
+	// Event failed auth checks
+	MetricsOutcomeRejected = "rejected"
+	// Terminated the transaction
+	MetricsOutcomeFatal = "fatal"
+	// The event has missing auth_events we need to fetch
+	MetricsWorkMissingAuthEvents = "missing_auth_events"
+	// No work had to be done as we had all prev/auth events
+	MetricsWorkDirect = "direct"
+	// The event has missing prev_events we need to call /g_m_e for
+	MetricsWorkMissingPrevEvents = "missing_prev_events"
+)
+
+var (
+	pduCountTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "dendrite",
+			Subsystem: "federationapi",
+			Name:      "recv_pdus",
+			Help:      "Number of incoming PDUs from remote servers with labels for success",
+		},
+		[]string{"status"}, // 'success' or 'total'
+	)
+	eduCountTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "dendrite",
+			Subsystem: "federationapi",
+			Name:      "recv_edus",
+			Help:      "Number of incoming EDUs from remote servers",
+		},
+	)
+	processEventSummary = prometheus.NewSummaryVec(
+		prometheus.SummaryOpts{
+			Namespace: "dendrite",
+			Subsystem: "federationapi",
+			Name:      "process_event",
+			Help:      "How long it takes to process an incoming event and what work had to be done for it",
+		},
+		[]string{"work", "outcome"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(
+		pduCountTotal, eduCountTotal, processEventSummary,
+	)
+}
+
+type sendFIFOQueue struct {
+	tasks  []*inputTask
+	count  int
+	mutex  sync.Mutex
+	notifs chan struct{}
+}
+
+func newSendFIFOQueue() *sendFIFOQueue {
+	q := &sendFIFOQueue{
+		notifs: make(chan struct{}, 1),
+	}
+	return q
+}
+
+func (q *sendFIFOQueue) push(frame *inputTask) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	q.tasks = append(q.tasks, frame)
+	q.count++
+	select {
+	case q.notifs <- struct{}{}:
+	default:
+	}
+}
+
+// pop returns the first item of the queue, if there is one.
+// The second return value will indicate if a task was returned.
+func (q *sendFIFOQueue) pop() (*inputTask, bool) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if q.count == 0 {
+		return nil, false
+	}
+	frame := q.tasks[0]
+	q.tasks[0] = nil
+	q.tasks = q.tasks[1:]
+	q.count--
+	if q.count == 0 {
+		// Force a GC of the underlying array, since it might have
+		// grown significantly if the queue was hammered for some reason
+		q.tasks = nil
+	}
+	return frame, true
+}
+
+type inputTask struct {
+	ctx      context.Context
+	t        *txnReq
+	event    *gomatrixserverlib.Event
+	wg       *sync.WaitGroup
+	err      error         // written back by worker, only safe to read when all tasks are done
+	duration time.Duration // written back by worker, only safe to read when all tasks are done
+}
+
+type inputWorker struct {
+	running atomic.Bool
+	input   *sendFIFOQueue
+}
+
+var inputWorkers sync.Map // room ID -> *inputWorker
 
 // Send implements /_matrix/federation/v1/send/{txnID}
 func Send(
@@ -43,15 +161,19 @@ func Send(
 	keyAPI keyapi.KeyInternalAPI,
 	keys gomatrixserverlib.JSONVerifier,
 	federation *gomatrixserverlib.FederationClient,
+	mu *internal.MutexByRoom,
+	servers federationAPI.ServersInRoomProvider,
 ) util.JSONResponse {
 	t := txnReq{
 		rsAPI:      rsAPI,
 		eduAPI:     eduAPI,
 		keys:       keys,
 		federation: federation,
+		hadEvents:  make(map[string]bool),
 		haveEvents: make(map[string]*gomatrixserverlib.HeaderedEvent),
-		newEvents:  make(map[string]bool),
+		servers:    servers,
 		keyAPI:     keyAPI,
+		roomsMu:    mu,
 	}
 
 	var txnEvents struct {
@@ -106,11 +228,23 @@ type txnReq struct {
 	keyAPI     keyapi.KeyInternalAPI
 	keys       gomatrixserverlib.JSONVerifier
 	federation txnFederationClient
+	roomsMu    *internal.MutexByRoom
+	// something that can tell us about which servers are in a room right now
+	servers federationAPI.ServersInRoomProvider
+	// a list of events from the auth and prev events which we already had
+	hadEvents      map[string]bool
+	hadEventsMutex sync.Mutex
 	// local cache of events for auth checks, etc - this may include events
 	// which the roomserver is unaware of.
-	haveEvents map[string]*gomatrixserverlib.HeaderedEvent
-	// new events which the roomserver does not know about
-	newEvents map[string]bool
+	haveEvents      map[string]*gomatrixserverlib.HeaderedEvent
+	haveEventsMutex sync.Mutex
+	work            string // metrics
+}
+
+func (t *txnReq) hadEvent(eventID string, had bool) {
+	t.hadEventsMutex.Lock()
+	defer t.hadEventsMutex.Unlock()
+	t.hadEvents[eventID] = had
 }
 
 // A subset of FederationClient functionality that txn requires. Useful for testing.
@@ -126,9 +260,11 @@ type txnFederationClient interface {
 
 func (t *txnReq) processTransaction(ctx context.Context) (*gomatrixserverlib.RespSend, *util.JSONResponse) {
 	results := make(map[string]gomatrixserverlib.PDUResult)
+	var wg sync.WaitGroup
+	var tasks []*inputTask
 
-	pdus := []gomatrixserverlib.HeaderedEvent{}
 	for _, pdu := range t.PDUs {
+		pduCountTotal.WithLabelValues("total").Inc()
 		var header struct {
 			RoomID string `json:"room_id"`
 		}
@@ -170,90 +306,105 @@ func (t *txnReq) processTransaction(ctx context.Context) (*gomatrixserverlib.Res
 			}
 			continue
 		}
-		if err = gomatrixserverlib.VerifyAllEventSignatures(ctx, []gomatrixserverlib.Event{event}, t.keys); err != nil {
+		if err = gomatrixserverlib.VerifyAllEventSignatures(ctx, []*gomatrixserverlib.Event{event}, t.keys); err != nil {
 			util.GetLogger(ctx).WithError(err).Warnf("Transaction: Couldn't validate signature of event %q", event.EventID())
 			results[event.EventID()] = gomatrixserverlib.PDUResult{
 				Error: err.Error(),
 			}
 			continue
 		}
-		pdus = append(pdus, event.Headered(verRes.RoomVersion))
-	}
-
-	// Process the events.
-	for _, e := range pdus {
-		if err := t.processEvent(ctx, e.Unwrap(), true); err != nil {
-			// If the error is due to the event itself being bad then we skip
-			// it and move onto the next event. We report an error so that the
-			// sender knows that we have skipped processing it.
-			//
-			// However if the event is due to a temporary failure in our server
-			// such as a database being unavailable then we should bail, and
-			// hope that the sender will retry when we are feeling better.
-			//
-			// It is uncertain what we should do if an event fails because
-			// we failed to fetch more information from the sending server.
-			// For example if a request to /state fails.
-			// If we skip the event then we risk missing the event until we
-			// receive another event referencing it.
-			// If we bail and stop processing then we risk wedging incoming
-			// transactions from that server forever.
-			if isProcessingErrorFatal(err) {
-				// Any other error should be the result of a temporary error in
-				// our server so we should bail processing the transaction entirely.
-				util.GetLogger(ctx).Warnf("Processing %s failed fatally: %s", e.EventID(), err)
-				jsonErr := util.ErrorResponse(err)
-				return nil, &jsonErr
-			} else {
-				// Auth errors mean the event is 'rejected' which have to be silent to appease sytest
-				errMsg := ""
-				_, rejected := err.(*gomatrixserverlib.NotAllowed)
-				if !rejected {
-					errMsg = err.Error()
-				}
-				util.GetLogger(ctx).WithError(err).WithField("event_id", e.EventID()).WithField("rejected", rejected).Warn(
-					"Failed to process incoming federation event, skipping",
-				)
-				results[e.EventID()] = gomatrixserverlib.PDUResult{
-					Error: errMsg,
-				}
-			}
-		} else {
-			results[e.EventID()] = gomatrixserverlib.PDUResult{}
+		v, _ := inputWorkers.LoadOrStore(event.RoomID(), &inputWorker{
+			input: newSendFIFOQueue(),
+		})
+		worker := v.(*inputWorker)
+		wg.Add(1)
+		task := &inputTask{
+			ctx:   ctx,
+			t:     t,
+			event: event,
+			wg:    &wg,
+		}
+		tasks = append(tasks, task)
+		worker.input.push(task)
+		if worker.running.CAS(false, true) {
+			go worker.run()
 		}
 	}
 
 	t.processEDUs(ctx)
+	wg.Wait()
+
+	for _, task := range tasks {
+		if task.err != nil {
+			results[task.event.EventID()] = gomatrixserverlib.PDUResult{
+				Error: task.err.Error(),
+			}
+		} else {
+			results[task.event.EventID()] = gomatrixserverlib.PDUResult{}
+		}
+	}
+
 	if c := len(results); c > 0 {
 		util.GetLogger(ctx).Infof("Processed %d PDUs from transaction %q", c, t.TransactionID)
 	}
 	return &gomatrixserverlib.RespSend{PDUs: results}, nil
 }
 
-// isProcessingErrorFatal returns true if the error is really bad and
-// we should stop processing the transaction, and returns false if it
-// is just some less serious error about a specific event.
-func isProcessingErrorFatal(err error) bool {
-	switch err.(type) {
-	case roomNotFoundError:
-	case *gomatrixserverlib.NotAllowed:
-	case missingPrevEventsError:
-	default:
-		switch err {
-		case context.Canceled:
-		case context.DeadlineExceeded:
-		default:
-			return true
+func (t *inputWorker) run() {
+	defer t.running.Store(false)
+	for {
+		task, ok := t.input.pop()
+		if !ok {
+			return
 		}
+		if task == nil {
+			continue
+		}
+		func() {
+			defer task.wg.Done()
+			select {
+			case <-task.ctx.Done():
+				task.err = context.DeadlineExceeded
+				pduCountTotal.WithLabelValues("expired").Inc()
+				return
+			default:
+				evStart := time.Now()
+				// TODO: Is 5 minutes too long?
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
+				task.err = task.t.processEvent(ctx, task.event)
+				cancel()
+				task.duration = time.Since(evStart)
+				if err := task.err; err != nil {
+					switch err.(type) {
+					case *gomatrixserverlib.NotAllowed:
+						processEventSummary.WithLabelValues(task.t.work, MetricsOutcomeRejected).Observe(
+							float64(time.Since(evStart).Nanoseconds()) / 1000.,
+						)
+						util.GetLogger(task.ctx).WithError(err).WithField("event_id", task.event.EventID()).WithField("rejected", true).Warn(
+							"Failed to process incoming federation event, skipping",
+						)
+						task.err = nil // make "rejected" failures silent
+					default:
+						processEventSummary.WithLabelValues(task.t.work, MetricsOutcomeFail).Observe(
+							float64(time.Since(evStart).Nanoseconds()) / 1000.,
+						)
+						util.GetLogger(task.ctx).WithError(err).WithField("event_id", task.event.EventID()).WithField("rejected", false).Warn(
+							"Failed to process incoming federation event, skipping",
+						)
+					}
+				} else {
+					pduCountTotal.WithLabelValues("success").Inc()
+					processEventSummary.WithLabelValues(task.t.work, MetricsOutcomeOK).Observe(
+						float64(time.Since(evStart).Nanoseconds()) / 1000.,
+					)
+				}
+			}
+		}()
 	}
-	return false
 }
 
 type roomNotFoundError struct {
 	roomID string
-}
-type unmarshalError struct {
-	err error
 }
 type verifySigError struct {
 	eventID string
@@ -265,7 +416,6 @@ type missingPrevEventsError struct {
 }
 
 func (e roomNotFoundError) Error() string { return fmt.Sprintf("room %q not found", e.roomID) }
-func (e unmarshalError) Error() string    { return fmt.Sprintf("unable to parse event: %s", e.err) }
 func (e verifySigError) Error() string {
 	return fmt.Sprintf("unable to verify signature of event %q: %s", e.eventID, e.err)
 }
@@ -273,20 +423,9 @@ func (e missingPrevEventsError) Error() string {
 	return fmt.Sprintf("unable to get prev_events for event %q: %s", e.eventID, e.err)
 }
 
-func (t *txnReq) haveEventIDs() map[string]bool {
-	result := make(map[string]bool, len(t.haveEvents))
-	for eventID := range t.haveEvents {
-		if t.newEvents[eventID] {
-			continue
-		}
-		result[eventID] = true
-	}
-	return result
-}
-
-// nolint:gocyclo
 func (t *txnReq) processEDUs(ctx context.Context) {
 	for _, e := range t.EDUs {
+		eduCountTotal.Inc()
 		switch e.Type {
 		case gomatrixserverlib.MTyping:
 			// https://matrix.org/docs/spec/server_server/latest#typing-notifications
@@ -297,6 +436,15 @@ func (t *txnReq) processEDUs(ctx context.Context) {
 			}
 			if err := json.Unmarshal(e.Content, &typingPayload); err != nil {
 				util.GetLogger(ctx).WithError(err).Error("Failed to unmarshal typing event")
+				continue
+			}
+			_, domain, err := gomatrixserverlib.SplitID('@', typingPayload.UserID)
+			if err != nil {
+				util.GetLogger(ctx).WithError(err).Error("Failed to split domain from typing event sender")
+				continue
+			}
+			if domain != t.Origin {
+				util.GetLogger(ctx).Warnf("Dropping typing event where sender domain (%q) doesn't match origin (%q)", domain, t.Origin)
 				continue
 			}
 			if err := eduserverAPI.SendTyping(ctx, t.eduAPI, typingPayload.UserID, typingPayload.RoomID, typingPayload.Typing, 30*1000); err != nil {
@@ -323,10 +471,67 @@ func (t *txnReq) processEDUs(ctx context.Context) {
 			}
 		case gomatrixserverlib.MDeviceListUpdate:
 			t.processDeviceListUpdate(ctx, e)
+		case gomatrixserverlib.MReceipt:
+			// https://matrix.org/docs/spec/server_server/r0.1.4#receipts
+			payload := map[string]eduserverAPI.FederationReceiptMRead{}
+
+			if err := json.Unmarshal(e.Content, &payload); err != nil {
+				util.GetLogger(ctx).WithError(err).Error("Failed to unmarshal receipt event")
+				continue
+			}
+
+			for roomID, receipt := range payload {
+				for userID, mread := range receipt.User {
+					_, domain, err := gomatrixserverlib.SplitID('@', userID)
+					if err != nil {
+						util.GetLogger(ctx).WithError(err).Error("Failed to split domain from receipt event sender")
+						continue
+					}
+					if t.Origin != domain {
+						util.GetLogger(ctx).Warnf("Dropping receipt event where sender domain (%q) doesn't match origin (%q)", domain, t.Origin)
+						continue
+					}
+					if err := t.processReceiptEvent(ctx, userID, roomID, "m.read", mread.Data.TS, mread.EventIDs); err != nil {
+						util.GetLogger(ctx).WithError(err).WithFields(logrus.Fields{
+							"sender":  t.Origin,
+							"user_id": userID,
+							"room_id": roomID,
+							"events":  mread.EventIDs,
+						}).Error("Failed to send receipt event to edu server")
+						continue
+					}
+				}
+			}
 		default:
 			util.GetLogger(ctx).WithField("type", e.Type).Debug("Unhandled EDU")
 		}
 	}
+}
+
+// processReceiptEvent sends receipt events to the edu server
+func (t *txnReq) processReceiptEvent(ctx context.Context,
+	userID, roomID, receiptType string,
+	timestamp gomatrixserverlib.Timestamp,
+	eventIDs []string,
+) error {
+	// store every event
+	for _, eventID := range eventIDs {
+		req := eduserverAPI.InputReceiptEventRequest{
+			InputReceiptEvent: eduserverAPI.InputReceiptEvent{
+				UserID:    userID,
+				RoomID:    roomID,
+				EventID:   eventID,
+				Type:      receiptType,
+				Timestamp: timestamp,
+			},
+		}
+		resp := eduserverAPI.InputReceiptEventResponse{}
+		if err := t.eduAPI.InputReceiptEvent(ctx, &req, &resp); err != nil {
+			return fmt.Errorf("unable to set receipt event: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (t *txnReq) processDeviceListUpdate(ctx context.Context, e gomatrixserverlib.EDU) {
@@ -344,11 +549,53 @@ func (t *txnReq) processDeviceListUpdate(ctx context.Context, e gomatrixserverli
 	}
 }
 
-func (t *txnReq) processEvent(ctx context.Context, e gomatrixserverlib.Event, isInboundTxn bool) error {
+func (t *txnReq) getServers(ctx context.Context, roomID string, event *gomatrixserverlib.Event) []gomatrixserverlib.ServerName {
+	// The server that sent us the event should be sufficient to tell us about missing
+	// prev and auth events.
+	servers := []gomatrixserverlib.ServerName{t.Origin}
+	// If the event origin is different to the transaction origin then we can use
+	// this as a last resort. The origin server that created the event would have
+	// had to know the auth and prev events.
+	if event != nil {
+		if origin := event.Origin(); origin != t.Origin {
+			servers = append(servers, origin)
+		}
+	}
+	// If a specific room-to-server provider exists then use that. This will primarily
+	// be used for the P2P demos.
+	if t.servers != nil {
+		servers = append(servers, t.servers.GetServersForRoom(ctx, roomID, event)...)
+	}
+	return servers
+}
+
+func (t *txnReq) processEvent(ctx context.Context, e *gomatrixserverlib.Event) error {
 	logger := util.GetLogger(ctx).WithField("event_id", e.EventID()).WithField("room_id", e.RoomID())
+	t.work = "" // reset from previous event
+
+	// Ask the roomserver if we know about the room and/or if we're joined
+	// to it. If we aren't then we won't bother processing the event.
+	joinedReq := api.QueryServerJoinedToRoomRequest{
+		RoomID: e.RoomID(),
+	}
+	var joinedRes api.QueryServerJoinedToRoomResponse
+	if err := t.rsAPI.QueryServerJoinedToRoom(ctx, &joinedReq, &joinedRes); err != nil {
+		return fmt.Errorf("t.rsAPI.QueryServerJoinedToRoom: %w", err)
+	}
+
+	if !joinedRes.RoomExists || !joinedRes.IsInRoom {
+		// We don't believe we're a member of this room, therefore there's
+		// no point in wasting work trying to figure out what to do with
+		// missing auth or prev events. Drop the event.
+		return roomNotFoundError{e.RoomID()}
+	}
 
 	// Work out if the roomserver knows everything it needs to know to auth
-	// the event.
+	// the event. This includes the prev_events and auth_events.
+	// NOTE! This is going to include prev_events that have an empty state
+	// snapshot. This is because we will need to re-request the event, and
+	// it's /state_ids, in order for it to exist in the roomserver correctly
+	// before the roomserver tries to work out
 	stateReq := api.QueryMissingAuthPrevEventsRequest{
 		RoomID:       e.RoomID(),
 		AuthEventIDs: e.AuthEventIDs(),
@@ -356,68 +603,32 @@ func (t *txnReq) processEvent(ctx context.Context, e gomatrixserverlib.Event, is
 	}
 	var stateResp api.QueryMissingAuthPrevEventsResponse
 	if err := t.rsAPI.QueryMissingAuthPrevEvents(ctx, &stateReq, &stateResp); err != nil {
-		return err
+		return fmt.Errorf("t.rsAPI.QueryMissingAuthPrevEvents: %w", err)
 	}
 
-	if !stateResp.RoomExists {
-		// TODO: When synapse receives a message for a room it is not in it
-		// asks the remote server for the state of the room so that it can
-		// check if the remote server knows of a join "m.room.member" event
-		// that this server is unaware of.
-		// However generally speaking we should reject events for rooms we
-		// aren't a member of.
-		return roomNotFoundError{e.RoomID()}
+	// Prepare a map of all the events we already had before this point, so
+	// that we don't send them to the roomserver again.
+	for _, eventID := range append(e.AuthEventIDs(), e.PrevEventIDs()...) {
+		t.hadEvent(eventID, true)
+	}
+	for _, eventID := range append(stateResp.MissingAuthEventIDs, stateResp.MissingPrevEventIDs...) {
+		t.hadEvent(eventID, false)
 	}
 
 	if len(stateResp.MissingAuthEventIDs) > 0 {
+		t.work = MetricsWorkMissingAuthEvents
 		logger.Infof("Event refers to %d unknown auth_events", len(stateResp.MissingAuthEventIDs))
-
-		servers := []gomatrixserverlib.ServerName{t.Origin}
-		serverReq := &api.QueryServerJoinedToRoomRequest{
-			RoomID: e.RoomID(),
-		}
-		serverRes := &api.QueryServerJoinedToRoomResponse{}
-		if err := t.rsAPI.QueryServerJoinedToRoom(ctx, serverReq, serverRes); err == nil {
-			servers = append(servers, serverRes.ServerNames...)
-			logger.Infof("Found %d server(s) to query for missing events", len(servers))
-		}
-
-	getAuthEvent:
-		for _, missingAuthEventID := range stateResp.MissingAuthEventIDs {
-			for _, server := range servers {
-				logger.Infof("Retrieving missing auth event %q from %q", missingAuthEventID, server)
-				tx, err := t.federation.GetEvent(ctx, server, missingAuthEventID)
-				if err != nil {
-					continue // try the next server
-				}
-				ev, err := gomatrixserverlib.NewEventFromUntrustedJSON(tx.PDUs[0], stateResp.RoomVersion)
-				if err != nil {
-					logger.WithError(err).Errorf("Failed to unmarshal auth event %q", missingAuthEventID)
-					continue // try the next server
-				}
-				if err = api.SendInputRoomEvents(
-					context.Background(),
-					t.rsAPI,
-					[]api.InputRoomEvent{
-						{
-							Kind:         api.KindOutlier,
-							Event:        ev.Headered(stateResp.RoomVersion),
-							AuthEventIDs: ev.AuthEventIDs(),
-							SendAsServer: api.DoNotSendToOtherServers,
-						},
-					},
-				); err != nil {
-					logger.WithError(err).Errorf("Failed to send auth event %q to roomserver", missingAuthEventID)
-					continue getAuthEvent // move onto the next event
-				}
-			}
+		if err := t.retrieveMissingAuthEvents(ctx, e, &stateResp); err != nil {
+			return fmt.Errorf("t.retrieveMissingAuthEvents: %w", err)
 		}
 	}
 
 	if len(stateResp.MissingPrevEventIDs) > 0 {
+		t.work = MetricsWorkMissingPrevEvents
 		logger.Infof("Event refers to %d unknown prev_events", len(stateResp.MissingPrevEventIDs))
-		return t.processEventWithMissingState(ctx, e, stateResp.RoomVersion, isInboundTxn)
+		return t.processEventWithMissingState(ctx, e, stateResp.RoomVersion)
 	}
+	t.work = MetricsWorkDirect
 
 	// pass the event to the roomserver which will do auth checks
 	// If the event fail auth checks, gmsl.NotAllowed error will be returned which we be silently
@@ -425,7 +636,8 @@ func (t *txnReq) processEvent(ctx context.Context, e gomatrixserverlib.Event, is
 	return api.SendEvents(
 		context.Background(),
 		t.rsAPI,
-		[]gomatrixserverlib.HeaderedEvent{
+		api.KindNew,
+		[]*gomatrixserverlib.HeaderedEvent{
 			e.Headered(stateResp.RoomVersion),
 		},
 		api.DoNotSendToOtherServers,
@@ -433,10 +645,65 @@ func (t *txnReq) processEvent(ctx context.Context, e gomatrixserverlib.Event, is
 	)
 }
 
-func checkAllowedByState(e gomatrixserverlib.Event, stateEvents []gomatrixserverlib.Event) error {
+func (t *txnReq) retrieveMissingAuthEvents(
+	ctx context.Context, e *gomatrixserverlib.Event, stateResp *api.QueryMissingAuthPrevEventsResponse,
+) error {
+	logger := util.GetLogger(ctx).WithField("event_id", e.EventID()).WithField("room_id", e.RoomID())
+
+	missingAuthEvents := make(map[string]struct{})
+	for _, missingAuthEventID := range stateResp.MissingAuthEventIDs {
+		missingAuthEvents[missingAuthEventID] = struct{}{}
+	}
+
+withNextEvent:
+	for missingAuthEventID := range missingAuthEvents {
+	withNextServer:
+		for _, server := range t.getServers(ctx, e.RoomID(), e) {
+			logger.Infof("Retrieving missing auth event %q from %q", missingAuthEventID, server)
+			tx, err := t.federation.GetEvent(ctx, server, missingAuthEventID)
+			if err != nil {
+				logger.WithError(err).Warnf("Failed to retrieve auth event %q", missingAuthEventID)
+				if errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
+				continue withNextServer
+			}
+			ev, err := gomatrixserverlib.NewEventFromUntrustedJSON(tx.PDUs[0], stateResp.RoomVersion)
+			if err != nil {
+				logger.WithError(err).Warnf("Failed to unmarshal auth event %q", missingAuthEventID)
+				continue withNextServer
+			}
+			if err = api.SendInputRoomEvents(
+				context.Background(),
+				t.rsAPI,
+				[]api.InputRoomEvent{
+					{
+						Kind:         api.KindOutlier,
+						Event:        ev.Headered(stateResp.RoomVersion),
+						AuthEventIDs: ev.AuthEventIDs(),
+						SendAsServer: api.DoNotSendToOtherServers,
+					},
+				},
+			); err != nil {
+				return fmt.Errorf("api.SendEvents: %w", err)
+			}
+			t.hadEvent(ev.EventID(), true) // if the roomserver didn't know about the event before, it does now
+			t.cacheAndReturn(ev.Headered(stateResp.RoomVersion))
+			delete(missingAuthEvents, missingAuthEventID)
+			continue withNextEvent
+		}
+	}
+
+	if missing := len(missingAuthEvents); missing > 0 {
+		return fmt.Errorf("Event refers to %d auth_events which we failed to fetch", missing)
+	}
+	return nil
+}
+
+func checkAllowedByState(e *gomatrixserverlib.Event, stateEvents []*gomatrixserverlib.Event) error {
 	authUsingState := gomatrixserverlib.NewAuthEvents(nil)
 	for i := range stateEvents {
-		err := authUsingState.AddEvent(&stateEvents[i])
+		err := authUsingState.AddEvent(stateEvents[i])
 		if err != nil {
 			return err
 		}
@@ -444,12 +711,9 @@ func checkAllowedByState(e gomatrixserverlib.Event, stateEvents []gomatrixserver
 	return gomatrixserverlib.Allowed(e, &authUsingState)
 }
 
-func (t *txnReq) processEventWithMissingState(ctx context.Context, e gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion, isInboundTxn bool) error {
-	// Do this with a fresh context, so that we keep working even if the
-	// original request times out. With any luck, by the time the remote
-	// side retries, we'll have fetched the missing state.
-	gmectx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
-	defer cancel()
+func (t *txnReq) processEventWithMissingState(
+	ctx context.Context, e *gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion,
+) error {
 	// We are missing the previous events for this events.
 	// This means that there is a gap in our view of the history of the
 	// room. There two ways that we can handle such a gap:
@@ -470,66 +734,156 @@ func (t *txnReq) processEventWithMissingState(ctx context.Context, e gomatrixser
 	// - fill in the gap completely then process event `e` returning no backwards extremity
 	// - fail to fill in the gap and tell us to terminate the transaction err=not nil
 	// - fail to fill in the gap and tell us to fetch state at the new backwards extremity, and to not terminate the transaction
-	backwardsExtremity, err := t.getMissingEvents(gmectx, e, roomVersion, isInboundTxn)
+	newEvents, err := t.getMissingEvents(ctx, e, roomVersion)
 	if err != nil {
 		return err
 	}
-	if backwardsExtremity == nil {
-		// we filled in the gap!
+	if len(newEvents) == 0 {
 		return nil
 	}
 
-	// at this point we know we're going to have a gap: we need to work out the room state at the new backwards extremity.
-	// security: we have to do state resolution on the new backwards extremity (TODO: WHY)
-	// Therefore, we cannot just query /state_ids with this event to get the state before. Instead, we need to query
-	// the state AFTER all the prev_events for this event, then apply state resolution to that to get the state before the event.
-	var states []*gomatrixserverlib.RespState
-	needed := gomatrixserverlib.StateNeededForAuth([]gomatrixserverlib.Event{*backwardsExtremity}).Tuples()
-	for _, prevEventID := range backwardsExtremity.PrevEventIDs() {
-		var prevState *gomatrixserverlib.RespState
-		prevState, err = t.lookupStateAfterEvent(gmectx, roomVersion, backwardsExtremity.RoomID(), prevEventID, needed)
-		if err != nil {
-			util.GetLogger(ctx).WithError(err).Errorf("Failed to lookup state after prev_event: %s", prevEventID)
-			return err
-		}
-		states = append(states, prevState)
-	}
-	resolvedState, err := t.resolveStatesAndCheck(gmectx, roomVersion, states, backwardsExtremity)
-	if err != nil {
-		util.GetLogger(ctx).WithError(err).Errorf("Failed to resolve state conflicts for event %s", backwardsExtremity.EventID())
-		return err
+	backwardsExtremity := newEvents[0]
+	newEvents = newEvents[1:]
+
+	type respState struct {
+		// A snapshot is considered trustworthy if it came from our own roomserver.
+		// That's because the state will have been through state resolution once
+		// already in QueryStateAfterEvent.
+		trustworthy bool
+		*gomatrixserverlib.RespState
 	}
 
-	// pass the event along with the state to the roomserver using a background context so we don't
-	// needlessly expire
-	return api.SendEventWithState(context.Background(), t.rsAPI, resolvedState, e.Headered(roomVersion), t.haveEventIDs())
+	// at this point we know we're going to have a gap: we need to work out the room state at the new backwards extremity.
+	// Therefore, we cannot just query /state_ids with this event to get the state before. Instead, we need to query
+	// the state AFTER all the prev_events for this event, then apply state resolution to that to get the state before the event.
+	var states []*respState
+	for _, prevEventID := range backwardsExtremity.PrevEventIDs() {
+		// Look up what the state is after the backward extremity. This will either
+		// come from the roomserver, if we know all the required events, or it will
+		// come from a remote server via /state_ids if not.
+		prevState, trustworthy, lerr := t.lookupStateAfterEvent(ctx, roomVersion, backwardsExtremity.RoomID(), prevEventID)
+		if lerr != nil {
+			util.GetLogger(ctx).WithError(lerr).Errorf("Failed to lookup state after prev_event: %s", prevEventID)
+			return lerr
+		}
+		// Append the state onto the collected state. We'll run this through the
+		// state resolution next.
+		states = append(states, &respState{trustworthy, prevState})
+	}
+
+	// Now that we have collected all of the state from the prev_events, we'll
+	// run the state through the appropriate state resolution algorithm for the
+	// room if needed. This does a couple of things:
+	// 1. Ensures that the state is deduplicated fully for each state-key tuple
+	// 2. Ensures that we pick the latest events from both sets, in the case that
+	//    one of the prev_events is quite a bit older than the others
+	resolvedState := &gomatrixserverlib.RespState{}
+	switch len(states) {
+	case 0:
+		extremityIsCreate := backwardsExtremity.Type() == gomatrixserverlib.MRoomCreate && backwardsExtremity.StateKeyEquals("")
+		if !extremityIsCreate {
+			// There are no previous states and this isn't the beginning of the
+			// room - this is an error condition!
+			util.GetLogger(ctx).Errorf("Failed to lookup any state after prev_events")
+			return fmt.Errorf("expected %d states but got %d", len(backwardsExtremity.PrevEventIDs()), len(states))
+		}
+	case 1:
+		// There's only one previous state - if it's trustworthy (came from a
+		// local state snapshot which will already have been through state res),
+		// use it as-is. There's no point in resolving it again.
+		if states[0].trustworthy {
+			resolvedState = states[0].RespState
+			break
+		}
+		// Otherwise, if it isn't trustworthy (came from federation), run it through
+		// state resolution anyway for safety, in case there are duplicates.
+		fallthrough
+	default:
+		respStates := make([]*gomatrixserverlib.RespState, len(states))
+		for i := range states {
+			respStates[i] = states[i].RespState
+		}
+		// There's more than one previous state - run them all through state res
+		t.roomsMu.Lock(e.RoomID())
+		resolvedState, err = t.resolveStatesAndCheck(ctx, roomVersion, respStates, backwardsExtremity)
+		t.roomsMu.Unlock(e.RoomID())
+		if err != nil {
+			util.GetLogger(ctx).WithError(err).Errorf("Failed to resolve state conflicts for event %s", backwardsExtremity.EventID())
+			return err
+		}
+	}
+
+	// First of all, send the backward extremity into the roomserver with the
+	// newly resolved state. This marks the "oldest" point in the backfill and
+	// sets the baseline state for any new events after this. We'll make a
+	// copy of the hadEvents map so that it can be taken downstream without
+	// worrying about concurrent map reads/writes, since t.hadEvents is meant
+	// to be protected by a mutex.
+	hadEvents := map[string]bool{}
+	t.hadEventsMutex.Lock()
+	for k, v := range t.hadEvents {
+		hadEvents[k] = v
+	}
+	t.hadEventsMutex.Unlock()
+	err = api.SendEventWithState(
+		context.Background(),
+		t.rsAPI,
+		api.KindOld,
+		resolvedState,
+		backwardsExtremity.Headered(roomVersion),
+		hadEvents,
+	)
+	if err != nil {
+		return fmt.Errorf("api.SendEventWithState: %w", err)
+	}
+
+	// Then send all of the newer backfilled events, of which will all be newer
+	// than the backward extremity, into the roomserver without state. This way
+	// they will automatically fast-forward based on the room state at the
+	// extremity in the last step.
+	headeredNewEvents := make([]*gomatrixserverlib.HeaderedEvent, len(newEvents))
+	for i, newEvent := range newEvents {
+		headeredNewEvents[i] = newEvent.Headered(roomVersion)
+	}
+	if err = api.SendEvents(
+		context.Background(),
+		t.rsAPI,
+		api.KindOld,
+		append(headeredNewEvents, e.Headered(roomVersion)),
+		api.DoNotSendToOtherServers,
+		nil,
+	); err != nil {
+		return fmt.Errorf("api.SendEvents: %w", err)
+	}
+
+	return nil
 }
 
 // lookupStateAfterEvent returns the room state after `eventID`, which is the state before eventID with the state of `eventID` (if it's a state event)
 // added into the mix.
-func (t *txnReq) lookupStateAfterEvent(ctx context.Context, roomVersion gomatrixserverlib.RoomVersion, roomID, eventID string, needed []gomatrixserverlib.StateKeyTuple) (*gomatrixserverlib.RespState, error) {
+func (t *txnReq) lookupStateAfterEvent(ctx context.Context, roomVersion gomatrixserverlib.RoomVersion, roomID, eventID string) (*gomatrixserverlib.RespState, bool, error) {
 	// try doing all this locally before we resort to querying federation
-	respState := t.lookupStateAfterEventLocally(ctx, roomID, eventID, needed)
+	respState := t.lookupStateAfterEventLocally(ctx, roomID, eventID)
 	if respState != nil {
-		return respState, nil
+		return respState, true, nil
 	}
 
 	respState, err := t.lookupStateBeforeEvent(ctx, roomVersion, roomID, eventID)
 	if err != nil {
-		return nil, err
+		return nil, false, fmt.Errorf("t.lookupStateBeforeEvent: %w", err)
 	}
 
 	// fetch the event we're missing and add it to the pile
-	h, err := t.lookupEvent(ctx, roomVersion, eventID, false)
+	h, err := t.lookupEvent(ctx, roomVersion, roomID, eventID, false)
 	switch err.(type) {
 	case verifySigError:
-		return respState, nil
+		return respState, false, nil
 	case nil:
 		// do nothing
 	default:
-		return nil, err
+		return nil, false, fmt.Errorf("t.lookupEvent: %w", err)
 	}
-	t.haveEvents[h.EventID()] = h
+	h = t.cacheAndReturn(h)
 	if h.StateKey() != nil {
 		addedToState := false
 		for i := range respState.StateEvents {
@@ -545,58 +899,76 @@ func (t *txnReq) lookupStateAfterEvent(ctx context.Context, roomVersion gomatrix
 		}
 	}
 
-	return respState, nil
+	return respState, false, nil
 }
 
-func (t *txnReq) lookupStateAfterEventLocally(ctx context.Context, roomID, eventID string, needed []gomatrixserverlib.StateKeyTuple) *gomatrixserverlib.RespState {
+func (t *txnReq) cacheAndReturn(ev *gomatrixserverlib.HeaderedEvent) *gomatrixserverlib.HeaderedEvent {
+	t.haveEventsMutex.Lock()
+	defer t.haveEventsMutex.Unlock()
+	if cached, exists := t.haveEvents[ev.EventID()]; exists {
+		return cached
+	}
+	t.haveEvents[ev.EventID()] = ev
+	return ev
+}
+
+func (t *txnReq) lookupStateAfterEventLocally(ctx context.Context, roomID, eventID string) *gomatrixserverlib.RespState {
 	var res api.QueryStateAfterEventsResponse
 	err := t.rsAPI.QueryStateAfterEvents(ctx, &api.QueryStateAfterEventsRequest{
 		RoomID:       roomID,
 		PrevEventIDs: []string{eventID},
-		StateToFetch: needed,
 	}, &res)
 	if err != nil || !res.PrevEventsExist {
-		util.GetLogger(ctx).WithError(err).Warnf("failed to query state after %s locally", eventID)
+		util.GetLogger(ctx).WithField("room_id", roomID).WithError(err).Warnf("failed to query state after %s locally, prev exists=%v", eventID, res.PrevEventsExist)
 		return nil
 	}
+	stateEvents := make([]*gomatrixserverlib.HeaderedEvent, len(res.StateEvents))
 	for i, ev := range res.StateEvents {
-		t.haveEvents[ev.EventID()] = &res.StateEvents[i]
+		// set the event from the haveEvents cache - this means we will share pointers with other prev_event branches for this
+		// processEvent request, which is better for memory.
+		stateEvents[i] = t.cacheAndReturn(ev)
+		t.hadEvent(ev.EventID(), true)
 	}
-	var authEvents []gomatrixserverlib.Event
-	missingAuthEvents := make(map[string]bool)
-	for _, ev := range res.StateEvents {
+	// we should never access res.StateEvents again so we delete it here to make GC faster
+	res.StateEvents = nil
+
+	var authEvents []*gomatrixserverlib.Event
+	missingAuthEvents := map[string]bool{}
+	for _, ev := range stateEvents {
+		t.haveEventsMutex.Lock()
 		for _, ae := range ev.AuthEventIDs() {
-			aev, ok := t.haveEvents[ae]
-			if ok {
+			if aev, ok := t.haveEvents[ae]; ok {
 				authEvents = append(authEvents, aev.Unwrap())
 			} else {
 				missingAuthEvents[ae] = true
 			}
 		}
+		t.haveEventsMutex.Unlock()
 	}
 	// QueryStateAfterEvents does not return the auth events, so fetch them now. We know the roomserver has them else it wouldn't
 	// have stored the event.
-	var missingEventList []string
-	for evID := range missingAuthEvents {
-		missingEventList = append(missingEventList, evID)
-	}
-	queryReq := api.QueryEventsByIDRequest{
-		EventIDs: missingEventList,
-	}
-	util.GetLogger(ctx).Infof("Fetching missing auth events: %v", missingEventList)
-	var queryRes api.QueryEventsByIDResponse
-	if err = t.rsAPI.QueryEventsByID(ctx, &queryReq, &queryRes); err != nil {
-		return nil
-	}
-	for i := range queryRes.Events {
-		evID := queryRes.Events[i].EventID()
-		t.haveEvents[evID] = &queryRes.Events[i]
-		authEvents = append(authEvents, queryRes.Events[i].Unwrap())
+	if len(missingAuthEvents) > 0 {
+		var missingEventList []string
+		for evID := range missingAuthEvents {
+			missingEventList = append(missingEventList, evID)
+		}
+		queryReq := api.QueryEventsByIDRequest{
+			EventIDs: missingEventList,
+		}
+		util.GetLogger(ctx).WithField("count", len(missingEventList)).Infof("Fetching missing auth events")
+		var queryRes api.QueryEventsByIDResponse
+		if err = t.rsAPI.QueryEventsByID(ctx, &queryReq, &queryRes); err != nil {
+			return nil
+		}
+		for i, ev := range queryRes.Events {
+			authEvents = append(authEvents, t.cacheAndReturn(queryRes.Events[i]).Unwrap())
+			t.hadEvent(ev.EventID(), true)
+		}
+		queryRes.Events = nil
 	}
 
-	evs := gomatrixserverlib.UnwrapEventHeaders(res.StateEvents)
 	return &gomatrixserverlib.RespState{
-		StateEvents: evs,
+		StateEvents: gomatrixserverlib.UnwrapEventHeaders(stateEvents),
 		AuthEvents:  authEvents,
 	}
 }
@@ -606,15 +978,13 @@ func (t *txnReq) lookupStateAfterEventLocally(ctx context.Context, roomID, event
 func (t *txnReq) lookupStateBeforeEvent(ctx context.Context, roomVersion gomatrixserverlib.RoomVersion, roomID, eventID string) (
 	*gomatrixserverlib.RespState, error) {
 
-	util.GetLogger(ctx).Infof("lookupStateBeforeEvent %s", eventID)
-
 	// Attempt to fetch the missing state using /state_ids and /events
 	return t.lookupMissingStateViaStateIDs(ctx, roomID, eventID, roomVersion)
 }
 
 func (t *txnReq) resolveStatesAndCheck(ctx context.Context, roomVersion gomatrixserverlib.RoomVersion, states []*gomatrixserverlib.RespState, backwardsExtremity *gomatrixserverlib.Event) (*gomatrixserverlib.RespState, error) {
-	var authEventList []gomatrixserverlib.Event
-	var stateEventList []gomatrixserverlib.Event
+	var authEventList []*gomatrixserverlib.Event
+	var stateEventList []*gomatrixserverlib.Event
 	for _, state := range states {
 		authEventList = append(authEventList, state.AuthEvents...)
 		stateEventList = append(stateEventList, state.StateEvents...)
@@ -625,10 +995,10 @@ func (t *txnReq) resolveStatesAndCheck(ctx context.Context, roomVersion gomatrix
 	}
 	// apply the current event
 retryAllowedState:
-	if err = checkAllowedByState(*backwardsExtremity, resolvedStateEvents); err != nil {
+	if err = checkAllowedByState(backwardsExtremity, resolvedStateEvents); err != nil {
 		switch missing := err.(type) {
 		case gomatrixserverlib.MissingAuthEventError:
-			h, err2 := t.lookupEvent(ctx, roomVersion, missing.AuthEventID, true)
+			h, err2 := t.lookupEvent(ctx, roomVersion, backwardsExtremity.RoomID(), missing.AuthEventID, true)
 			switch err2.(type) {
 			case verifySigError:
 				return &gomatrixserverlib.RespState{
@@ -653,18 +1023,9 @@ retryAllowedState:
 	}, nil
 }
 
-// getMissingEvents returns a nil backwardsExtremity if missing events were fetched and handled, else returns the new backwards extremity which we should
-// begin from. Returns an error only if we should terminate the transaction which initiated /get_missing_events
-// This function recursively calls txnReq.processEvent with the missing events, which will be processed before this function returns.
-// This means that we may recursively call this function, as we spider back up prev_events.
-// nolint:gocyclo
-func (t *txnReq) getMissingEvents(ctx context.Context, e gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion, isInboundTxn bool) (backwardsExtremity *gomatrixserverlib.Event, err error) {
-	if !isInboundTxn {
-		// we've recursed here, so just take a state snapshot please!
-		return &e, nil
-	}
+func (t *txnReq) getMissingEvents(ctx context.Context, e *gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion) (newEvents []*gomatrixserverlib.Event, err error) {
 	logger := util.GetLogger(ctx).WithField("event_id", e.EventID()).WithField("room_id", e.RoomID())
-	needed := gomatrixserverlib.StateNeededForAuth([]gomatrixserverlib.Event{e})
+	needed := gomatrixserverlib.StateNeededForAuth([]*gomatrixserverlib.Event{e})
 	// query latest events (our trusted forward extremities)
 	req := api.QueryLatestEventsAndStateRequest{
 		RoomID:       e.RoomID(),
@@ -673,24 +1034,16 @@ func (t *txnReq) getMissingEvents(ctx context.Context, e gomatrixserverlib.Event
 	var res api.QueryLatestEventsAndStateResponse
 	if err = t.rsAPI.QueryLatestEventsAndState(ctx, &req, &res); err != nil {
 		logger.WithError(err).Warn("Failed to query latest events")
-		return &e, nil
+		return nil, err
 	}
 	latestEvents := make([]string, len(res.LatestEvents))
-	for i := range res.LatestEvents {
+	for i, ev := range res.LatestEvents {
 		latestEvents[i] = res.LatestEvents[i].EventID
-	}
-
-	servers := []gomatrixserverlib.ServerName{t.Origin}
-	serverReq := &api.QueryServerJoinedToRoomRequest{
-		RoomID: e.RoomID(),
-	}
-	serverRes := &api.QueryServerJoinedToRoomResponse{}
-	if err = t.rsAPI.QueryServerJoinedToRoom(ctx, serverReq, serverRes); err == nil {
-		servers = append(servers, serverRes.ServerNames...)
-		logger.Infof("Found %d server(s) to query for missing events", len(servers))
+		t.hadEvent(ev.EventID, true)
 	}
 
 	var missingResp *gomatrixserverlib.RespMissingEvents
+	servers := t.getServers(ctx, e.RoomID(), e)
 	for _, server := range servers {
 		var m gomatrixserverlib.RespMissingEvents
 		if m, err = t.federation.LookupMissingEvents(ctx, server, e.RoomID(), gomatrixserverlib.MissingEvents{
@@ -704,6 +1057,9 @@ func (t *txnReq) getMissingEvents(ctx context.Context, e gomatrixserverlib.Event
 			break
 		} else {
 			logger.WithError(err).Errorf("%s pushed us an event but %q did not respond to /get_missing_events", t.Origin, server)
+			if errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
 		}
 	}
 
@@ -731,8 +1087,14 @@ func (t *txnReq) getMissingEvents(ctx context.Context, e gomatrixserverlib.Event
 	// For now, we do not allow Case B, so reject the event.
 	logger.Infof("get_missing_events returned %d events", len(missingResp.Events))
 
+	// Make sure events from the missingResp are using the cache - missing events
+	// will be added and duplicates will be removed.
+	for i, ev := range missingResp.Events {
+		missingResp.Events[i] = t.cacheAndReturn(ev.Headered(roomVersion)).Unwrap()
+	}
+
 	// topologically sort and sanity check that we are making forward progress
-	newEvents := gomatrixserverlib.ReverseTopologicalOrdering(missingResp.Events, gomatrixserverlib.TopologicalOrderByPrevEvents)
+	newEvents = gomatrixserverlib.ReverseTopologicalOrdering(missingResp.Events, gomatrixserverlib.TopologicalOrderByPrevEvents)
 	shouldHaveSomeEventIDs := e.PrevEventIDs()
 	hasPrevEvent := false
 Event:
@@ -755,16 +1117,8 @@ Event:
 			err:     err,
 		}
 	}
-	// process the missing events then the event which started this whole thing
-	for _, ev := range append(newEvents, e) {
-		err := t.processEvent(ctx, ev, false)
-		if err != nil {
-			return nil, err
-		}
-	}
 
-	// we processed everything!
-	return nil, nil
+	return newEvents, nil
 }
 
 func (t *txnReq) lookupMissingStateViaState(ctx context.Context, roomID, eventID string, roomVersion gomatrixserverlib.RoomVersion) (
@@ -777,13 +1131,20 @@ func (t *txnReq) lookupMissingStateViaState(ctx context.Context, roomID, eventID
 	if err := state.Check(ctx, t.keys, nil); err != nil {
 		return nil, err
 	}
+	// Cache the results of this state lookup and deduplicate anything we already
+	// have in the cache, freeing up memory.
+	for i, ev := range state.AuthEvents {
+		state.AuthEvents[i] = t.cacheAndReturn(ev.Headered(roomVersion)).Unwrap()
+	}
+	for i, ev := range state.StateEvents {
+		state.StateEvents[i] = t.cacheAndReturn(ev.Headered(roomVersion)).Unwrap()
+	}
 	return &state, nil
 }
 
-// nolint:gocyclo
 func (t *txnReq) lookupMissingStateViaStateIDs(ctx context.Context, roomID, eventID string, roomVersion gomatrixserverlib.RoomVersion) (
 	*gomatrixserverlib.RespState, error) {
-	util.GetLogger(ctx).Infof("lookupMissingStateViaStateIDs %s", eventID)
+	util.GetLogger(ctx).WithField("room_id", roomID).Infof("lookupMissingStateViaStateIDs %s", eventID)
 	// fetch the state event IDs at the time of the event
 	stateIDs, err := t.federation.LookupStateIDs(ctx, t.Origin, roomID, eventID)
 	if err != nil {
@@ -793,6 +1154,7 @@ func (t *txnReq) lookupMissingStateViaStateIDs(ctx context.Context, roomID, even
 	wantIDs := append(stateIDs.StateEventIDs, stateIDs.AuthEventIDs...)
 	missing := make(map[string]bool)
 	var missingEventList []string
+	t.haveEventsMutex.Lock()
 	for _, sid := range wantIDs {
 		if _, ok := t.haveEvents[sid]; !ok {
 			if !missing[sid] {
@@ -801,6 +1163,7 @@ func (t *txnReq) lookupMissingStateViaStateIDs(ctx context.Context, roomID, even
 			}
 		}
 	}
+	t.haveEventsMutex.Unlock()
 
 	// fetch as many as we can from the roomserver
 	queryReq := api.QueryEventsByIDRequest{
@@ -810,16 +1173,19 @@ func (t *txnReq) lookupMissingStateViaStateIDs(ctx context.Context, roomID, even
 	if err = t.rsAPI.QueryEventsByID(ctx, &queryReq, &queryRes); err != nil {
 		return nil, err
 	}
-	for i := range queryRes.Events {
+	for i, ev := range queryRes.Events {
+		queryRes.Events[i] = t.cacheAndReturn(queryRes.Events[i])
+		t.hadEvent(ev.EventID(), true)
 		evID := queryRes.Events[i].EventID()
-		t.haveEvents[evID] = &queryRes.Events[i]
 		if missing[evID] {
 			delete(missing, evID)
 		}
 	}
+	queryRes.Events = nil // allow it to be GCed
 
 	concurrentRequests := 8
 	missingCount := len(missing)
+	util.GetLogger(ctx).WithField("room_id", roomID).WithField("event_id", eventID).Infof("lookupMissingStateViaStateIDs missing %d/%d events", missingCount, len(wantIDs))
 
 	// If over 50% of the auth/state events from /state_ids are missing
 	// then we'll just call /state instead, otherwise we'll just end up
@@ -835,98 +1201,103 @@ func (t *txnReq) lookupMissingStateViaStateIDs(ctx context.Context, roomID, even
 		return t.lookupMissingStateViaState(ctx, roomID, eventID, roomVersion)
 	}
 
-	util.GetLogger(ctx).WithFields(logrus.Fields{
-		"missing":             missingCount,
-		"event_id":            eventID,
-		"room_id":             roomID,
-		"total_state":         len(stateIDs.StateEventIDs),
-		"total_auth_events":   len(stateIDs.AuthEventIDs),
-		"concurrent_requests": concurrentRequests,
-	}).Info("Fetching missing state at event")
+	if missingCount > 0 {
+		util.GetLogger(ctx).WithFields(logrus.Fields{
+			"missing":             missingCount,
+			"event_id":            eventID,
+			"room_id":             roomID,
+			"total_state":         len(stateIDs.StateEventIDs),
+			"total_auth_events":   len(stateIDs.AuthEventIDs),
+			"concurrent_requests": concurrentRequests,
+		}).Info("Fetching missing state at event")
 
-	// Create a queue containing all of the missing event IDs that we want
-	// to retrieve.
-	pending := make(chan string, missingCount)
-	for missingEventID := range missing {
-		pending <- missingEventID
-	}
-	close(pending)
-
-	// Define how many workers we should start to do this.
-	if missingCount < concurrentRequests {
-		concurrentRequests = missingCount
-	}
-
-	// Create the wait group.
-	var fetchgroup sync.WaitGroup
-	fetchgroup.Add(concurrentRequests)
-
-	// This is the only place where we'll write to t.haveEvents from
-	// multiple goroutines, and everywhere else is blocked on this
-	// synchronous function anyway.
-	var haveEventsMutex sync.Mutex
-
-	// Define what we'll do in order to fetch the missing event ID.
-	fetch := func(missingEventID string) {
-		var h *gomatrixserverlib.HeaderedEvent
-		h, err = t.lookupEvent(ctx, roomVersion, missingEventID, false)
-		switch err.(type) {
-		case verifySigError:
-			return
-		case nil:
-			break
-		default:
-			util.GetLogger(ctx).WithFields(logrus.Fields{
-				"event_id": missingEventID,
-				"room_id":  roomID,
-			}).Info("Failed to fetch missing event")
-			return
+		// Create a queue containing all of the missing event IDs that we want
+		// to retrieve.
+		pending := make(chan string, missingCount)
+		for missingEventID := range missing {
+			pending <- missingEventID
 		}
-		haveEventsMutex.Lock()
-		t.haveEvents[h.EventID()] = h
-		haveEventsMutex.Unlock()
-	}
+		close(pending)
 
-	// Create the worker.
-	worker := func(ch <-chan string) {
-		defer fetchgroup.Done()
-		for missingEventID := range ch {
-			fetch(missingEventID)
+		// Define how many workers we should start to do this.
+		if missingCount < concurrentRequests {
+			concurrentRequests = missingCount
 		}
+
+		// Create the wait group.
+		var fetchgroup sync.WaitGroup
+		fetchgroup.Add(concurrentRequests)
+
+		// This is the only place where we'll write to t.haveEvents from
+		// multiple goroutines, and everywhere else is blocked on this
+		// synchronous function anyway.
+		var haveEventsMutex sync.Mutex
+
+		// Define what we'll do in order to fetch the missing event ID.
+		fetch := func(missingEventID string) {
+			var h *gomatrixserverlib.HeaderedEvent
+			h, err = t.lookupEvent(ctx, roomVersion, roomID, missingEventID, false)
+			switch err.(type) {
+			case verifySigError:
+				return
+			case nil:
+				break
+			default:
+				util.GetLogger(ctx).WithFields(logrus.Fields{
+					"event_id": missingEventID,
+					"room_id":  roomID,
+				}).Info("Failed to fetch missing event")
+				return
+			}
+			haveEventsMutex.Lock()
+			t.cacheAndReturn(h)
+			haveEventsMutex.Unlock()
+		}
+
+		// Create the worker.
+		worker := func(ch <-chan string) {
+			defer fetchgroup.Done()
+			for missingEventID := range ch {
+				fetch(missingEventID)
+			}
+		}
+
+		// Start the workers.
+		for i := 0; i < concurrentRequests; i++ {
+			go worker(pending)
+		}
+
+		// Wait for the workers to finish.
+		fetchgroup.Wait()
 	}
 
-	// Start the workers.
-	for i := 0; i < concurrentRequests; i++ {
-		go worker(pending)
-	}
-
-	// Wait for the workers to finish.
-	fetchgroup.Wait()
 	resp, err := t.createRespStateFromStateIDs(stateIDs)
 	return resp, err
 }
 
 func (t *txnReq) createRespStateFromStateIDs(stateIDs gomatrixserverlib.RespStateIDs) (
-	*gomatrixserverlib.RespState, error) {
+	*gomatrixserverlib.RespState, error) { // nolint:unparam
+	t.haveEventsMutex.Lock()
+	defer t.haveEventsMutex.Unlock()
+
 	// create a RespState response using the response to /state_ids as a guide
-	respState := gomatrixserverlib.RespState{
-		AuthEvents:  make([]gomatrixserverlib.Event, len(stateIDs.AuthEventIDs)),
-		StateEvents: make([]gomatrixserverlib.Event, len(stateIDs.StateEventIDs)),
-	}
+	respState := gomatrixserverlib.RespState{}
 
 	for i := range stateIDs.StateEventIDs {
 		ev, ok := t.haveEvents[stateIDs.StateEventIDs[i]]
 		if !ok {
-			return nil, fmt.Errorf("missing state event %s", stateIDs.StateEventIDs[i])
+			logrus.Warnf("Missing state event in createRespStateFromStateIDs: %s", stateIDs.StateEventIDs[i])
+			continue
 		}
-		respState.StateEvents[i] = ev.Unwrap()
+		respState.StateEvents = append(respState.StateEvents, ev.Unwrap())
 	}
 	for i := range stateIDs.AuthEventIDs {
 		ev, ok := t.haveEvents[stateIDs.AuthEventIDs[i]]
 		if !ok {
-			return nil, fmt.Errorf("missing auth event %s", stateIDs.AuthEventIDs[i])
+			logrus.Warnf("Missing auth event in createRespStateFromStateIDs: %s", stateIDs.AuthEventIDs[i])
+			continue
 		}
-		respState.AuthEvents[i] = ev.Unwrap()
+		respState.AuthEvents = append(respState.AuthEvents, ev.Unwrap())
 	}
 	// We purposefully do not do auth checks on the returned events, as they will still
 	// be processed in the exact same way, just as a 'rejected' event
@@ -934,7 +1305,7 @@ func (t *txnReq) createRespStateFromStateIDs(stateIDs gomatrixserverlib.RespStat
 	return &respState, nil
 }
 
-func (t *txnReq) lookupEvent(ctx context.Context, roomVersion gomatrixserverlib.RoomVersion, missingEventID string, localFirst bool) (*gomatrixserverlib.HeaderedEvent, error) {
+func (t *txnReq) lookupEvent(ctx context.Context, roomVersion gomatrixserverlib.RoomVersion, roomID, missingEventID string, localFirst bool) (*gomatrixserverlib.HeaderedEvent, error) {
 	if localFirst {
 		// fetch from the roomserver
 		queryReq := api.QueryEventsByIDRequest{
@@ -944,26 +1315,36 @@ func (t *txnReq) lookupEvent(ctx context.Context, roomVersion gomatrixserverlib.
 		if err := t.rsAPI.QueryEventsByID(ctx, &queryReq, &queryRes); err != nil {
 			util.GetLogger(ctx).Warnf("Failed to query roomserver for missing event %s: %s - falling back to remote", missingEventID, err)
 		} else if len(queryRes.Events) == 1 {
-			return &queryRes.Events[0], nil
+			return queryRes.Events[0], nil
 		}
 	}
-	txn, err := t.federation.GetEvent(ctx, t.Origin, missingEventID)
-	if err != nil || len(txn.PDUs) == 0 {
-		util.GetLogger(ctx).WithError(err).WithField("event_id", missingEventID).Warn("failed to get missing /event for event ID")
-		return nil, err
+	var event *gomatrixserverlib.Event
+	found := false
+	servers := t.getServers(ctx, roomID, nil)
+	for _, serverName := range servers {
+		txn, err := t.federation.GetEvent(ctx, serverName, missingEventID)
+		if err != nil || len(txn.PDUs) == 0 {
+			util.GetLogger(ctx).WithError(err).WithField("event_id", missingEventID).Warn("Failed to get missing /event for event ID")
+			if errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
+			continue
+		}
+		event, err = gomatrixserverlib.NewEventFromUntrustedJSON(txn.PDUs[0], roomVersion)
+		if err != nil {
+			util.GetLogger(ctx).WithError(err).WithField("event_id", missingEventID).Warnf("Transaction: Failed to parse event JSON of event")
+			continue
+		}
+		found = true
+		break
 	}
-	pdu := txn.PDUs[0]
-	var event gomatrixserverlib.Event
-	event, err = gomatrixserverlib.NewEventFromUntrustedJSON(pdu, roomVersion)
-	if err != nil {
-		util.GetLogger(ctx).WithError(err).Warnf("Transaction: Failed to parse event JSON of event %q", event.EventID())
-		return nil, unmarshalError{err}
+	if !found {
+		util.GetLogger(ctx).WithField("event_id", missingEventID).Warnf("Failed to get missing /event for event ID from %d server(s)", len(servers))
+		return nil, fmt.Errorf("wasn't able to find event via %d server(s)", len(servers))
 	}
-	if err = gomatrixserverlib.VerifyAllEventSignatures(ctx, []gomatrixserverlib.Event{event}, t.keys); err != nil {
+	if err := gomatrixserverlib.VerifyAllEventSignatures(ctx, []*gomatrixserverlib.Event{event}, t.keys); err != nil {
 		util.GetLogger(ctx).WithError(err).Warnf("Transaction: Couldn't validate signature of event %q", event.EventID())
 		return nil, verifySigError{event.EventID(), err}
 	}
-	h := event.Headered(roomVersion)
-	t.newEvents[h.EventID()] = true
-	return &h, nil
+	return t.cacheAndReturn(event.Headered(roomVersion)), nil
 }

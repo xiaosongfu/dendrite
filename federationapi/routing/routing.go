@@ -20,11 +20,13 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
 	eduserverAPI "github.com/matrix-org/dendrite/eduserver/api"
+	federationAPI "github.com/matrix-org/dendrite/federationapi/api"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
-	"github.com/matrix-org/dendrite/internal/config"
+	"github.com/matrix-org/dendrite/internal"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	keyserverAPI "github.com/matrix-org/dendrite/keyserver/api"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
@@ -48,6 +50,8 @@ func Setup(
 	federation *gomatrixserverlib.FederationClient,
 	userAPI userapi.UserInternalAPI,
 	keyAPI keyserverAPI.KeyInternalAPI,
+	mscCfg *config.MSCs,
+	servers federationAPI.ServersInRoomProvider,
 ) {
 	v2keysmux := keyMux.PathPrefix("/v2").Subrouter()
 	v1fedmux := fedMux.PathPrefix("/v1").Subrouter()
@@ -91,12 +95,13 @@ func Setup(
 	v2keysmux.Handle("/query", notaryKeys).Methods(http.MethodPost)
 	v2keysmux.Handle("/query/{serverName}/{keyID}", notaryKeys).Methods(http.MethodGet)
 
+	mu := internal.NewMutexByRoom()
 	v1fedmux.Handle("/send/{txnID}", httputil.MakeFedAPI(
 		"federation_send", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
 			return Send(
 				httpReq, request, gomatrixserverlib.TransactionID(vars["txnID"]),
-				cfg, rsAPI, eduAPI, keyAPI, keys, federation,
+				cfg, rsAPI, eduAPI, keyAPI, keys, federation, mu, servers,
 			)
 		},
 	)).Methods(http.MethodPut, http.MethodOptions)
@@ -229,7 +234,39 @@ func Setup(
 		},
 	)).Methods(http.MethodGet)
 
-	v1fedmux.Handle("/make_join/{roomID}/{eventID}", httputil.MakeFedAPI(
+	if mscCfg.Enabled("msc2444") {
+		v1fedmux.Handle("/peek/{roomID}/{peekID}", httputil.MakeFedAPI(
+			"federation_peek", cfg.Matrix.ServerName, keys, wakeup,
+			func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+				if roomserverAPI.IsServerBannedFromRoom(httpReq.Context(), rsAPI, vars["roomID"], request.Origin()) {
+					return util.JSONResponse{
+						Code: http.StatusForbidden,
+						JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+					}
+				}
+				roomID := vars["roomID"]
+				peekID := vars["peekID"]
+				queryVars := httpReq.URL.Query()
+				remoteVersions := []gomatrixserverlib.RoomVersion{}
+				if vers, ok := queryVars["ver"]; ok {
+					// The remote side supplied a ?ver= so use that to build up the list
+					// of supported room versions
+					for _, v := range vers {
+						remoteVersions = append(remoteVersions, gomatrixserverlib.RoomVersion(v))
+					}
+				} else {
+					// The remote side didn't supply a ?ver= so just assume that they only
+					// support room version 1
+					remoteVersions = append(remoteVersions, gomatrixserverlib.RoomVersionV1)
+				}
+				return Peek(
+					httpReq, request, cfg, rsAPI, roomID, peekID, remoteVersions,
+				)
+			},
+		)).Methods(http.MethodPut, http.MethodDelete)
+	}
+
+	v1fedmux.Handle("/make_join/{roomID}/{userID}", httputil.MakeFedAPI(
 		"federation_make_join", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
 			if roomserverAPI.IsServerBannedFromRoom(httpReq.Context(), rsAPI, vars["roomID"], request.Origin()) {
@@ -239,11 +276,11 @@ func Setup(
 				}
 			}
 			roomID := vars["roomID"]
-			eventID := vars["eventID"]
+			userID := vars["userID"]
 			queryVars := httpReq.URL.Query()
 			remoteVersions := []gomatrixserverlib.RoomVersion{}
 			if vers, ok := queryVars["ver"]; ok {
-				// The remote side supplied a ?=ver so use that to build up the list
+				// The remote side supplied a ?ver= so use that to build up the list
 				// of supported room versions
 				for _, v := range vers {
 					remoteVersions = append(remoteVersions, gomatrixserverlib.RoomVersion(v))
@@ -255,7 +292,7 @@ func Setup(
 				remoteVersions = append(remoteVersions, gomatrixserverlib.RoomVersionV1)
 			}
 			return MakeJoin(
-				httpReq, request, cfg, rsAPI, roomID, eventID, remoteVersions,
+				httpReq, request, cfg, rsAPI, roomID, userID, remoteVersions,
 			)
 		},
 	)).Methods(http.MethodGet)
@@ -427,4 +464,10 @@ func Setup(
 			return QueryDeviceKeys(httpReq, request, keyAPI, cfg.Matrix.ServerName)
 		},
 	)).Methods(http.MethodPost)
+
+	v1fedmux.Handle("/openid/userinfo",
+		httputil.MakeExternalAPI("federation_openid_userinfo", func(req *http.Request) util.JSONResponse {
+			return GetOpenIDUserInfo(req, userAPI)
+		}),
+	).Methods(http.MethodGet)
 }

@@ -20,12 +20,13 @@ import (
 	"sync"
 
 	"github.com/Shopify/sarama"
+	"github.com/getsentry/sentry-go"
 	"github.com/matrix-org/dendrite/internal"
 	"github.com/matrix-org/dendrite/keyserver/api"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
-	syncinternal "github.com/matrix-org/dendrite/syncapi/internal"
+	"github.com/matrix-org/dendrite/setup/process"
+	"github.com/matrix-org/dendrite/syncapi/notifier"
 	"github.com/matrix-org/dendrite/syncapi/storage"
-	syncapi "github.com/matrix-org/dendrite/syncapi/sync"
 	"github.com/matrix-org/dendrite/syncapi/types"
 	"github.com/matrix-org/gomatrixserverlib"
 	log "github.com/sirupsen/logrus"
@@ -35,27 +36,31 @@ import (
 type OutputKeyChangeEventConsumer struct {
 	keyChangeConsumer   *internal.ContinualConsumer
 	db                  storage.Database
+	notifier            *notifier.Notifier
+	stream              types.PartitionedStreamProvider
 	serverName          gomatrixserverlib.ServerName // our server name
 	rsAPI               roomserverAPI.RoomserverInternalAPI
 	keyAPI              api.KeyInternalAPI
 	partitionToOffset   map[int32]int64
 	partitionToOffsetMu sync.Mutex
-	notifier            *syncapi.Notifier
 }
 
 // NewOutputKeyChangeEventConsumer creates a new OutputKeyChangeEventConsumer.
 // Call Start() to begin consuming from the key server.
 func NewOutputKeyChangeEventConsumer(
+	process *process.ProcessContext,
 	serverName gomatrixserverlib.ServerName,
 	topic string,
 	kafkaConsumer sarama.Consumer,
-	n *syncapi.Notifier,
 	keyAPI api.KeyInternalAPI,
 	rsAPI roomserverAPI.RoomserverInternalAPI,
 	store storage.Database,
+	notifier *notifier.Notifier,
+	stream types.PartitionedStreamProvider,
 ) *OutputKeyChangeEventConsumer {
 
 	consumer := internal.ContinualConsumer{
+		Process:        process,
 		ComponentName:  "syncapi/keychange",
 		Topic:          topic,
 		Consumer:       kafkaConsumer,
@@ -70,7 +75,8 @@ func NewOutputKeyChangeEventConsumer(
 		rsAPI:               rsAPI,
 		partitionToOffset:   make(map[int32]int64),
 		partitionToOffsetMu: sync.Mutex{},
-		notifier:            n,
+		notifier:            notifier,
+		stream:              stream,
 	}
 
 	consumer.ProcessMessage = s.onMessage
@@ -102,6 +108,7 @@ func (s *OutputKeyChangeEventConsumer) onMessage(msg *sarama.ConsumerMessage) er
 	if err := json.Unmarshal(msg.Value, &output); err != nil {
 		// If the message was invalid, log it and move on to the next message in the stream
 		log.WithError(err).Error("syncapi: failed to unmarshal key change event from key server")
+		sentry.CaptureException(err)
 		return err
 	}
 	// work out who we need to notify about the new key
@@ -111,17 +118,20 @@ func (s *OutputKeyChangeEventConsumer) onMessage(msg *sarama.ConsumerMessage) er
 	}, &queryRes)
 	if err != nil {
 		log.WithError(err).Error("syncapi: failed to QuerySharedUsers for key change event from key server")
+		sentry.CaptureException(err)
 		return err
 	}
-	// TODO: f.e queryRes.UserIDsToCount : notify users by waking up streams
-	posUpdate := types.NewStreamToken(0, 0, map[string]*types.LogPosition{
-		syncinternal.DeviceListLogName: {
-			Offset:    msg.Offset,
-			Partition: msg.Partition,
-		},
-	})
-	for userID := range queryRes.UserIDsToCount {
-		s.notifier.OnNewKeyChange(posUpdate, userID, output.UserID)
+	// make sure we get our own key updates too!
+	queryRes.UserIDsToCount[output.UserID] = 1
+	posUpdate := types.LogPosition{
+		Offset:    msg.Offset,
+		Partition: msg.Partition,
 	}
+
+	s.stream.Advance(posUpdate)
+	for userID := range queryRes.UserIDsToCount {
+		s.notifier.OnNewKeyChange(types.StreamingToken{DeviceListPosition: posUpdate}, userID, output.UserID)
+	}
+
 	return nil
 }

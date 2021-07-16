@@ -39,7 +39,7 @@ func AddRoutes(internalAPIMux *mux.Router, s api.UserInternalAPI) {
 			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
 		}),
 	)
-	internalAPIMux.Handle(PerformAccountCreationPath,
+	internalAPIMux.Handle(PerformPasswordUpdatePath,
 		httputil.MakeInternalAPI("performPasswordUpdate", func(req *http.Request) util.JSONResponse {
 			request := api.PerformPasswordUpdateRequest{}
 			response := api.PerformPasswordUpdateResponse{}
@@ -60,6 +60,19 @@ func AddRoutes(internalAPIMux *mux.Router, s api.UserInternalAPI) {
 				return util.MessageResponse(http.StatusBadRequest, err.Error())
 			}
 			if err := s.PerformDeviceCreation(req.Context(), &request, &response); err != nil {
+				return util.ErrorResponse(err)
+			}
+			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
+		}),
+	)
+	internalAPIMux.Handle(PerformLastSeenUpdatePath,
+		httputil.MakeInternalAPI("performLastSeenUpdate", func(req *http.Request) util.JSONResponse {
+			request := api.PerformLastSeenUpdateRequest{}
+			response := api.PerformLastSeenUpdateResponse{}
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				return util.MessageResponse(http.StatusBadRequest, err.Error())
+			}
+			if err := s.PerformLastSeenUpdate(req.Context(), &request, &response); err != nil {
 				return util.ErrorResponse(err)
 			}
 			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
@@ -99,6 +112,19 @@ func AddRoutes(internalAPIMux *mux.Router, s api.UserInternalAPI) {
 				return util.MessageResponse(http.StatusBadRequest, err.Error())
 			}
 			if err := s.PerformAccountDeactivation(req.Context(), &request, &response); err != nil {
+				return util.ErrorResponse(err)
+			}
+			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
+		}),
+	)
+	internalAPIMux.Handle(PerformOpenIDTokenCreationPath,
+		httputil.MakeInternalAPI("performOpenIDTokenCreation", func(req *http.Request) util.JSONResponse {
+			request := api.PerformOpenIDTokenCreationRequest{}
+			response := api.PerformOpenIDTokenCreationResponse{}
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				return util.MessageResponse(http.StatusBadRequest, err.Error())
+			}
+			if err := s.PerformOpenIDTokenCreation(req.Context(), &request, &response); err != nil {
 				return util.ErrorResponse(err)
 			}
 			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
@@ -169,7 +195,7 @@ func AddRoutes(internalAPIMux *mux.Router, s api.UserInternalAPI) {
 			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
 		}),
 	)
-	internalAPIMux.Handle(QueryDeviceInfosPath,
+	internalAPIMux.Handle(QuerySearchProfilesPath,
 		httputil.MakeInternalAPI("querySearchProfiles", func(req *http.Request) util.JSONResponse {
 			request := api.QuerySearchProfilesRequest{}
 			response := api.QuerySearchProfilesResponse{}
@@ -177,6 +203,32 @@ func AddRoutes(internalAPIMux *mux.Router, s api.UserInternalAPI) {
 				return util.MessageResponse(http.StatusBadRequest, err.Error())
 			}
 			if err := s.QuerySearchProfiles(req.Context(), &request, &response); err != nil {
+				return util.ErrorResponse(err)
+			}
+			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
+		}),
+	)
+	internalAPIMux.Handle(QueryOpenIDTokenPath,
+		httputil.MakeInternalAPI("queryOpenIDToken", func(req *http.Request) util.JSONResponse {
+			request := api.QueryOpenIDTokenRequest{}
+			response := api.QueryOpenIDTokenResponse{}
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				return util.MessageResponse(http.StatusBadRequest, err.Error())
+			}
+			if err := s.QueryOpenIDToken(req.Context(), &request, &response); err != nil {
+				return util.ErrorResponse(err)
+			}
+			return util.JSONResponse{Code: http.StatusOK, JSON: &response}
+		}),
+	)
+	internalAPIMux.Handle(InputAccountDataPath,
+		httputil.MakeInternalAPI("inputAccountDataPath", func(req *http.Request) util.JSONResponse {
+			request := api.InputAccountDataRequest{}
+			response := api.InputAccountDataResponse{}
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				return util.MessageResponse(http.StatusBadRequest, err.Error())
+			}
+			if err := s.InputAccountData(req.Context(), &request, &response); err != nil {
 				return util.ErrorResponse(err)
 			}
 			return util.JSONResponse{Code: http.StatusOK, JSON: &response}

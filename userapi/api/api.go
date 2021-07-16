@@ -29,14 +29,17 @@ type UserInternalAPI interface {
 	PerformPasswordUpdate(ctx context.Context, req *PerformPasswordUpdateRequest, res *PerformPasswordUpdateResponse) error
 	PerformDeviceCreation(ctx context.Context, req *PerformDeviceCreationRequest, res *PerformDeviceCreationResponse) error
 	PerformDeviceDeletion(ctx context.Context, req *PerformDeviceDeletionRequest, res *PerformDeviceDeletionResponse) error
+	PerformLastSeenUpdate(ctx context.Context, req *PerformLastSeenUpdateRequest, res *PerformLastSeenUpdateResponse) error
 	PerformDeviceUpdate(ctx context.Context, req *PerformDeviceUpdateRequest, res *PerformDeviceUpdateResponse) error
 	PerformAccountDeactivation(ctx context.Context, req *PerformAccountDeactivationRequest, res *PerformAccountDeactivationResponse) error
+	PerformOpenIDTokenCreation(ctx context.Context, req *PerformOpenIDTokenCreationRequest, res *PerformOpenIDTokenCreationResponse) error
 	QueryProfile(ctx context.Context, req *QueryProfileRequest, res *QueryProfileResponse) error
 	QueryAccessToken(ctx context.Context, req *QueryAccessTokenRequest, res *QueryAccessTokenResponse) error
 	QueryDevices(ctx context.Context, req *QueryDevicesRequest, res *QueryDevicesResponse) error
 	QueryAccountData(ctx context.Context, req *QueryAccountDataRequest, res *QueryAccountDataResponse) error
 	QueryDeviceInfos(ctx context.Context, req *QueryDeviceInfosRequest, res *QueryDeviceInfosResponse) error
 	QuerySearchProfiles(ctx context.Context, req *QuerySearchProfilesRequest, res *QuerySearchProfilesResponse) error
+	QueryOpenIDToken(ctx context.Context, req *QueryOpenIDTokenRequest, res *QueryOpenIDTokenResponse) error
 }
 
 // InputAccountDataRequest is the request for InputAccountData
@@ -183,6 +186,17 @@ type PerformPasswordUpdateResponse struct {
 	Account         *Account
 }
 
+// PerformLastSeenUpdateRequest is the request for PerformLastSeenUpdate.
+type PerformLastSeenUpdateRequest struct {
+	UserID     string
+	DeviceID   string
+	RemoteAddr string
+}
+
+// PerformLastSeenUpdateResponse is the response for PerformLastSeenUpdate.
+type PerformLastSeenUpdateResponse struct {
+}
+
 // PerformDeviceCreationRequest is the request for PerformDeviceCreation
 type PerformDeviceCreationRequest struct {
 	Localpart   string
@@ -192,6 +206,10 @@ type PerformDeviceCreationRequest struct {
 	DeviceID *string
 	// optional: if nil no display name will be associated with this device.
 	DeviceDisplayName *string
+	// IP address of this device
+	IPAddr string
+	// Useragent for this device
+	UserAgent string
 }
 
 // PerformDeviceCreationResponse is the response for PerformDeviceCreation
@@ -210,6 +228,27 @@ type PerformAccountDeactivationResponse struct {
 	AccountDeactivated bool
 }
 
+// PerformOpenIDTokenCreationRequest is the request for PerformOpenIDTokenCreation
+type PerformOpenIDTokenCreationRequest struct {
+	UserID string
+}
+
+// PerformOpenIDTokenCreationResponse is the response for PerformOpenIDTokenCreation
+type PerformOpenIDTokenCreationResponse struct {
+	Token OpenIDToken
+}
+
+// QueryOpenIDTokenRequest is the request for QueryOpenIDToken
+type QueryOpenIDTokenRequest struct {
+	Token string
+}
+
+// QueryOpenIDTokenResponse is the response for QueryOpenIDToken
+type QueryOpenIDTokenResponse struct {
+	Sub         string // The Matrix User ID that generated the token
+	ExpiresAtMS int64
+}
+
 // Device represents a client's device (mobile, web, etc)
 type Device struct {
 	ID     string
@@ -222,6 +261,12 @@ type Device struct {
 	// associated with access tokens.
 	SessionID   int64
 	DisplayName string
+	LastSeenTS  int64
+	LastSeenIP  string
+	UserAgent   string
+	// If the device is for an appservice user,
+	// this is the appservice ID.
+	AppserviceID string
 }
 
 // Account represents a Matrix account on this home server.
@@ -232,6 +277,24 @@ type Account struct {
 	AppServiceID string
 	// TODO: Other flags like IsAdmin, IsGuest
 	// TODO: Associations (e.g. with application services)
+}
+
+// OpenIDToken represents an OpenID token
+type OpenIDToken struct {
+	Token       string
+	UserID      string
+	ExpiresAtMS int64
+}
+
+// OpenIDTokenInfo represents the attributes associated with an issued OpenID token
+type OpenIDTokenAttributes struct {
+	UserID      string
+	ExpiresAtMS int64
+}
+
+// UserInfo is for returning information about the user an OpenID token was issued for
+type UserInfo struct {
+	Sub string // The Matrix user's ID who generated the token
 }
 
 // ErrorForbidden is an error indicating that the supplied access token is forbidden

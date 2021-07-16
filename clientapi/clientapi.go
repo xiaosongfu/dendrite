@@ -15,7 +15,6 @@
 package clientapi
 
 import (
-	"github.com/Shopify/sarama"
 	"github.com/gorilla/mux"
 	appserviceAPI "github.com/matrix-org/dendrite/appservice/api"
 	"github.com/matrix-org/dendrite/clientapi/api"
@@ -23,10 +22,11 @@ import (
 	"github.com/matrix-org/dendrite/clientapi/routing"
 	eduServerAPI "github.com/matrix-org/dendrite/eduserver/api"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/transactions"
 	keyserverAPI "github.com/matrix-org/dendrite/keyserver/api"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
+	"github.com/matrix-org/dendrite/setup/kafka"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
 	"github.com/matrix-org/gomatrixserverlib"
@@ -35,8 +35,8 @@ import (
 // AddPublicRoutes sets up and registers HTTP handlers for the ClientAPI component.
 func AddPublicRoutes(
 	router *mux.Router,
+	synapseAdminRouter *mux.Router,
 	cfg *config.ClientAPI,
-	producer sarama.SyncProducer,
 	accountsDB accounts.Database,
 	federation *gomatrixserverlib.FederationClient,
 	rsAPI roomserverAPI.RoomserverInternalAPI,
@@ -47,15 +47,18 @@ func AddPublicRoutes(
 	userAPI userapi.UserInternalAPI,
 	keyAPI keyserverAPI.KeyInternalAPI,
 	extRoomsProvider api.ExtraPublicRoomsProvider,
+	mscCfg *config.MSCs,
 ) {
+	_, producer := kafka.SetupConsumerProducer(&cfg.Matrix.Kafka)
+
 	syncProducer := &producers.SyncAPIProducer{
 		Producer: producer,
 		Topic:    cfg.Matrix.Kafka.TopicFor(config.TopicOutputClientData),
 	}
 
 	routing.Setup(
-		router, cfg, eduInputAPI, rsAPI, asAPI,
+		router, synapseAdminRouter, cfg, eduInputAPI, rsAPI, asAPI,
 		accountsDB, userAPI, federation,
-		syncProducer, transactionsCache, fsAPI, keyAPI, extRoomsProvider,
+		syncProducer, transactionsCache, fsAPI, keyAPI, extRoomsProvider, mscCfg,
 	)
 }

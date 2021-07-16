@@ -23,9 +23,9 @@ import (
 	"github.com/matrix-org/dendrite/clientapi/auth/authtypes"
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/eventutil"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
 	"github.com/matrix-org/gomatrixserverlib"
@@ -91,7 +91,6 @@ func GetAvatarURL(
 }
 
 // SetAvatarURL implements PUT /profile/{userID}/avatar_url
-// nolint:gocyclo
 func SetAvatarURL(
 	req *http.Request, accountDB accounts.Database,
 	device *userapi.Device, userID string, cfg *config.ClientAPI, rsAPI api.RoomserverInternalAPI,
@@ -170,7 +169,7 @@ func SetAvatarURL(
 		return jsonerror.InternalServerError()
 	}
 
-	if err := api.SendEvents(req.Context(), rsAPI, events, cfg.Matrix.ServerName, nil); err != nil {
+	if err := api.SendEvents(req.Context(), rsAPI, api.KindNew, events, cfg.Matrix.ServerName, nil); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("SendEvents failed")
 		return jsonerror.InternalServerError()
 	}
@@ -209,7 +208,6 @@ func GetDisplayName(
 }
 
 // SetDisplayName implements PUT /profile/{userID}/displayname
-// nolint:gocyclo
 func SetDisplayName(
 	req *http.Request, accountDB accounts.Database,
 	device *userapi.Device, userID string, cfg *config.ClientAPI, rsAPI api.RoomserverInternalAPI,
@@ -288,7 +286,7 @@ func SetDisplayName(
 		return jsonerror.InternalServerError()
 	}
 
-	if err := api.SendEvents(req.Context(), rsAPI, events, cfg.Matrix.ServerName, nil); err != nil {
+	if err := api.SendEvents(req.Context(), rsAPI, api.KindNew, events, cfg.Matrix.ServerName, nil); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("SendEvents failed")
 		return jsonerror.InternalServerError()
 	}
@@ -346,14 +344,14 @@ func buildMembershipEvents(
 	roomIDs []string,
 	newProfile authtypes.Profile, userID string, cfg *config.ClientAPI,
 	evTime time.Time, rsAPI api.RoomserverInternalAPI,
-) ([]gomatrixserverlib.HeaderedEvent, error) {
-	evs := []gomatrixserverlib.HeaderedEvent{}
+) ([]*gomatrixserverlib.HeaderedEvent, error) {
+	evs := []*gomatrixserverlib.HeaderedEvent{}
 
 	for _, roomID := range roomIDs {
 		verReq := api.QueryRoomVersionForRoomRequest{RoomID: roomID}
 		verRes := api.QueryRoomVersionForRoomResponse{}
 		if err := rsAPI.QueryRoomVersionForRoom(ctx, &verReq, &verRes); err != nil {
-			return []gomatrixserverlib.HeaderedEvent{}, err
+			return nil, err
 		}
 
 		builder := gomatrixserverlib.EventBuilder{
@@ -379,7 +377,7 @@ func buildMembershipEvents(
 			return nil, err
 		}
 
-		evs = append(evs, (*event).Headered(verRes.RoomVersion))
+		evs = append(evs, event.Headered(verRes.RoomVersion))
 	}
 
 	return evs, nil

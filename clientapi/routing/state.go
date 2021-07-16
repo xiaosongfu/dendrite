@@ -141,7 +141,7 @@ func OnIncomingStateRequest(ctx context.Context, device *userapi.Device, rsAPI a
 			util.GetLogger(ctx).WithError(err).Error("Failed to QueryMembershipForUser")
 			return jsonerror.InternalServerError()
 		}
-		for _, ev := range stateRes.StateEvents {
+		for _, ev := range stateAfterRes.StateEvents {
 			stateEvents = append(
 				stateEvents,
 				gomatrixserverlib.HeaderedToClientEvent(ev, gomatrixserverlib.FormatAll),
@@ -161,7 +161,6 @@ func OnIncomingStateRequest(ctx context.Context, device *userapi.Device, rsAPI a
 // state to see if there is an event with that type and state key, if there
 // is then (by default) we return the content, otherwise a 404.
 // If eventFormat=true, sends the whole event else just the content.
-// nolint:gocyclo
 func OnIncomingStateTypeRequest(
 	ctx context.Context, device *userapi.Device, rsAPI api.RoomserverInternalAPI,
 	roomID, evType, stateKey string, eventFormat bool,
@@ -267,7 +266,7 @@ func OnIncomingStateTypeRequest(
 		// to find the state event, if provided.
 		for _, ev := range stateRes.StateEvents {
 			if ev.Type() == evType && ev.StateKeyEquals(stateKey) {
-				event = &ev
+				event = ev
 				break
 			}
 		}
@@ -290,7 +289,7 @@ func OnIncomingStateTypeRequest(
 			return jsonerror.InternalServerError()
 		}
 		if len(stateAfterRes.StateEvents) > 0 {
-			event = &stateAfterRes.StateEvents[0]
+			event = stateAfterRes.StateEvents[0]
 		}
 	}
 
@@ -304,7 +303,7 @@ func OnIncomingStateTypeRequest(
 	}
 
 	stateEvent := stateEventInStateResp{
-		ClientEvent: gomatrixserverlib.HeaderedToClientEvent(*event, gomatrixserverlib.FormatAll),
+		ClientEvent: gomatrixserverlib.HeaderedToClientEvent(event, gomatrixserverlib.FormatAll),
 	}
 
 	var res interface{}

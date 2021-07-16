@@ -17,24 +17,29 @@ package shared
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/matrix-org/dendrite/federationsender/storage/tables"
 	"github.com/matrix-org/dendrite/federationsender/types"
+	"github.com/matrix-org/dendrite/internal/caching"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/gomatrixserverlib"
 )
 
 type Database struct {
-	DB                          *sql.DB
-	Writer                      sqlutil.Writer
-	FederationSenderQueuePDUs   tables.FederationSenderQueuePDUs
-	FederationSenderQueueEDUs   tables.FederationSenderQueueEDUs
-	FederationSenderQueueJSON   tables.FederationSenderQueueJSON
-	FederationSenderJoinedHosts tables.FederationSenderJoinedHosts
-	FederationSenderRooms       tables.FederationSenderRooms
-	FederationSenderBlacklist   tables.FederationSenderBlacklist
+	DB                            *sql.DB
+	Cache                         caching.FederationSenderCache
+	Writer                        sqlutil.Writer
+	FederationSenderQueuePDUs     tables.FederationSenderQueuePDUs
+	FederationSenderQueueEDUs     tables.FederationSenderQueueEDUs
+	FederationSenderQueueJSON     tables.FederationSenderQueueJSON
+	FederationSenderJoinedHosts   tables.FederationSenderJoinedHosts
+	FederationSenderBlacklist     tables.FederationSenderBlacklist
+	FederationSenderOutboundPeeks tables.FederationSenderOutboundPeeks
+	FederationSenderInboundPeeks  tables.FederationSenderInboundPeeks
+	NotaryServerKeysJSON          tables.FederationSenderNotaryServerKeysJSON
+	NotaryServerKeysMetadata      tables.FederationSenderNotaryServerKeysMetadata
 }
 
 // An Receipt contains the NIDs of a call to GetNextTransactionPDUs/EDUs.
@@ -42,16 +47,11 @@ type Database struct {
 // to pass them back so that we can clean up if the transaction sends
 // successfully.
 type Receipt struct {
-	nids []int64
+	nid int64
 }
 
-func (e *Receipt) Empty() bool {
-	return len(e.nids) == 0
-}
-
-func (e *Receipt) String() string {
-	j, _ := json.Marshal(e.nids)
-	return string(j)
+func (r *Receipt) String() string {
+	return fmt.Sprintf("%d", r.nid)
 }
 
 // UpdateRoom updates the joined hosts for a room and returns what the joined
@@ -66,29 +66,6 @@ func (d *Database) UpdateRoom(
 	removeHosts []string,
 ) (joinedHosts []types.JoinedHost, err error) {
 	err = d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
-		err = d.FederationSenderRooms.InsertRoom(ctx, txn, roomID)
-		if err != nil {
-			return err
-		}
-
-		lastSentEventID, err := d.FederationSenderRooms.SelectRoomForUpdate(ctx, txn, roomID)
-		if err != nil {
-			return err
-		}
-
-		if lastSentEventID == newEventID {
-			// We've handled this message before, so let's just ignore it.
-			// We can only get a duplicate for the last message we processed,
-			// so its enough just to compare the newEventID with lastSentEventID
-			return nil
-		}
-
-		if lastSentEventID != "" && lastSentEventID != oldEventID {
-			return types.EventIDMismatchError{
-				DatabaseID: lastSentEventID, RoomServerID: oldEventID,
-			}
-		}
-
 		joinedHosts, err = d.FederationSenderJoinedHosts.SelectJoinedHostsWithTx(ctx, txn, roomID)
 		if err != nil {
 			return err
@@ -103,7 +80,7 @@ func (d *Database) UpdateRoom(
 		if err = d.FederationSenderJoinedHosts.DeleteJoinedHosts(ctx, txn, removeHosts); err != nil {
 			return err
 		}
-		return d.FederationSenderRooms.UpdateRoom(ctx, txn, roomID, newEventID)
+		return nil
 	})
 	return
 }
@@ -144,8 +121,22 @@ func (d *Database) StoreJSON(
 		return nil, fmt.Errorf("d.insertQueueJSON: %w", err)
 	}
 	return &Receipt{
-		nids: []int64{nid},
+		nid: nid,
 	}, nil
+}
+
+func (d *Database) PurgeRoomState(
+	ctx context.Context, roomID string,
+) error {
+	return d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		// If the event is a create event then we'll delete all of the existing
+		// data for the room. The only reason that a create event would be replayed
+		// to us in this way is if we're about to receive the entire room state.
+		if err := d.FederationSenderJoinedHosts.DeleteJoinedHostsForRoom(ctx, txn, roomID); err != nil {
+			return fmt.Errorf("d.FederationSenderJoinedHosts.DeleteJoinedHosts: %w", err)
+		}
+		return nil
+	})
 }
 
 func (d *Database) AddServerToBlacklist(serverName gomatrixserverlib.ServerName) error {
@@ -160,6 +151,96 @@ func (d *Database) RemoveServerFromBlacklist(serverName gomatrixserverlib.Server
 	})
 }
 
+func (d *Database) RemoveAllServersFromBlacklist() error {
+	return d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		return d.FederationSenderBlacklist.DeleteAllBlacklist(context.TODO(), txn)
+	})
+}
+
 func (d *Database) IsServerBlacklisted(serverName gomatrixserverlib.ServerName) (bool, error) {
 	return d.FederationSenderBlacklist.SelectBlacklist(context.TODO(), nil, serverName)
+}
+
+func (d *Database) AddOutboundPeek(ctx context.Context, serverName gomatrixserverlib.ServerName, roomID, peekID string, renewalInterval int64) error {
+	return d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		return d.FederationSenderOutboundPeeks.InsertOutboundPeek(ctx, txn, serverName, roomID, peekID, renewalInterval)
+	})
+}
+
+func (d *Database) RenewOutboundPeek(ctx context.Context, serverName gomatrixserverlib.ServerName, roomID, peekID string, renewalInterval int64) error {
+	return d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		return d.FederationSenderOutboundPeeks.RenewOutboundPeek(ctx, txn, serverName, roomID, peekID, renewalInterval)
+	})
+}
+
+func (d *Database) GetOutboundPeek(ctx context.Context, serverName gomatrixserverlib.ServerName, roomID, peekID string) (*types.OutboundPeek, error) {
+	return d.FederationSenderOutboundPeeks.SelectOutboundPeek(ctx, nil, serverName, roomID, peekID)
+}
+
+func (d *Database) GetOutboundPeeks(ctx context.Context, roomID string) ([]types.OutboundPeek, error) {
+	return d.FederationSenderOutboundPeeks.SelectOutboundPeeks(ctx, nil, roomID)
+}
+
+func (d *Database) AddInboundPeek(ctx context.Context, serverName gomatrixserverlib.ServerName, roomID, peekID string, renewalInterval int64) error {
+	return d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		return d.FederationSenderInboundPeeks.InsertInboundPeek(ctx, txn, serverName, roomID, peekID, renewalInterval)
+	})
+}
+
+func (d *Database) RenewInboundPeek(ctx context.Context, serverName gomatrixserverlib.ServerName, roomID, peekID string, renewalInterval int64) error {
+	return d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		return d.FederationSenderInboundPeeks.RenewInboundPeek(ctx, txn, serverName, roomID, peekID, renewalInterval)
+	})
+}
+
+func (d *Database) GetInboundPeek(ctx context.Context, serverName gomatrixserverlib.ServerName, roomID, peekID string) (*types.InboundPeek, error) {
+	return d.FederationSenderInboundPeeks.SelectInboundPeek(ctx, nil, serverName, roomID, peekID)
+}
+
+func (d *Database) GetInboundPeeks(ctx context.Context, roomID string) ([]types.InboundPeek, error) {
+	return d.FederationSenderInboundPeeks.SelectInboundPeeks(ctx, nil, roomID)
+}
+
+func (d *Database) UpdateNotaryKeys(ctx context.Context, serverName gomatrixserverlib.ServerName, serverKeys gomatrixserverlib.ServerKeys) error {
+	return d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		validUntil := serverKeys.ValidUntilTS
+		// Servers MUST use the lesser of this field and 7 days into the future when determining if a key is valid.
+		// This is to avoid a situation where an attacker publishes a key which is valid for a significant amount of
+		// time without a way for the homeserver owner to revoke it.
+		// https://spec.matrix.org/unstable/server-server-api/#querying-keys-through-another-server
+		weekIntoFuture := time.Now().Add(7 * 24 * time.Hour)
+		if weekIntoFuture.Before(validUntil.Time()) {
+			validUntil = gomatrixserverlib.AsTimestamp(weekIntoFuture)
+		}
+		notaryID, err := d.NotaryServerKeysJSON.InsertJSONResponse(ctx, txn, serverKeys, serverName, validUntil)
+		if err != nil {
+			return err
+		}
+		// update the metadata for the keys
+		for keyID := range serverKeys.OldVerifyKeys {
+			_, err = d.NotaryServerKeysMetadata.UpsertKey(ctx, txn, serverName, keyID, notaryID, validUntil)
+			if err != nil {
+				return err
+			}
+		}
+		for keyID := range serverKeys.VerifyKeys {
+			_, err = d.NotaryServerKeysMetadata.UpsertKey(ctx, txn, serverName, keyID, notaryID, validUntil)
+			if err != nil {
+				return err
+			}
+		}
+
+		// clean up old responses
+		return d.NotaryServerKeysMetadata.DeleteOldJSONResponses(ctx, txn)
+	})
+}
+
+func (d *Database) GetNotaryKeys(
+	ctx context.Context, serverName gomatrixserverlib.ServerName, optKeyIDs []gomatrixserverlib.KeyID,
+) (sks []gomatrixserverlib.ServerKeys, err error) {
+	err = d.Writer.Do(d.DB, nil, func(txn *sql.Tx) error {
+		sks, err = d.NotaryServerKeysMetadata.SelectKeys(ctx, txn, serverName, optKeyIDs)
+		return err
+	})
+	return sks, err
 }

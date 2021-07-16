@@ -19,13 +19,13 @@ import (
 	"fmt"
 
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/dendrite/roomserver/internal/helpers"
 	"github.com/matrix-org/dendrite/roomserver/internal/input"
 	"github.com/matrix-org/dendrite/roomserver/state"
 	"github.com/matrix-org/dendrite/roomserver/storage"
 	"github.com/matrix-org/dendrite/roomserver/types"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrixserverlib"
 	log "github.com/sirupsen/logrus"
 )
@@ -37,7 +37,6 @@ type Inviter struct {
 	Inputer *input.Inputer
 }
 
-// nolint:gocyclo
 func (r *Inviter) PerformInvite(
 	ctx context.Context,
 	req *api.PerformInviteRequest,
@@ -86,7 +85,7 @@ func (r *Inviter) PerformInvite(
 
 	var isAlreadyJoined bool
 	if info != nil {
-		_, isAlreadyJoined, err = r.DB.GetMembership(ctx, info.RoomNID, *event.StateKey())
+		_, isAlreadyJoined, _, err = r.DB.GetMembership(ctx, info.RoomNID, *event.StateKey())
 		if err != nil {
 			return nil, fmt.Errorf("r.DB.GetMembership: %w", err)
 		}
@@ -198,7 +197,7 @@ func (r *Inviter) PerformInvite(
 		}
 
 		unwrapped := event.Unwrap()
-		outputUpdates, err := helpers.UpdateToInviteMembership(updater, &unwrapped, nil, req.Event.RoomVersion)
+		outputUpdates, err := helpers.UpdateToInviteMembership(updater, unwrapped, nil, req.Event.RoomVersion)
 		if err != nil {
 			return nil, fmt.Errorf("updateToInviteMembership: %w", err)
 		}
@@ -225,7 +224,7 @@ func buildInviteStrippedState(
 	for _, t := range []string{
 		gomatrixserverlib.MRoomName, gomatrixserverlib.MRoomCanonicalAlias,
 		gomatrixserverlib.MRoomAliases, gomatrixserverlib.MRoomJoinRules,
-		"m.room.avatar", "m.room.encryption",
+		"m.room.avatar", "m.room.encryption", gomatrixserverlib.MRoomCreate,
 	} {
 		stateWanted = append(stateWanted, gomatrixserverlib.StateKeyTuple{
 			EventType: t,
@@ -248,11 +247,11 @@ func buildInviteStrippedState(
 		return nil, err
 	}
 	inviteState := []gomatrixserverlib.InviteV2StrippedState{
-		gomatrixserverlib.NewInviteV2StrippedState(&input.Event.Event),
+		gomatrixserverlib.NewInviteV2StrippedState(input.Event.Event),
 	}
 	stateEvents = append(stateEvents, types.Event{Event: input.Event.Unwrap()})
 	for _, event := range stateEvents {
-		inviteState = append(inviteState, gomatrixserverlib.NewInviteV2StrippedState(&event.Event))
+		inviteState = append(inviteState, gomatrixserverlib.NewInviteV2StrippedState(event.Event))
 	}
 	return inviteState, nil
 }

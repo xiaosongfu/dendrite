@@ -36,6 +36,7 @@ import (
 type Queryer struct {
 	DB         storage.Database
 	Cache      caching.RoomServerCaches
+	ServerName gomatrixserverlib.ServerName
 	ServerACLs *acls.ServerACLs
 }
 
@@ -78,10 +79,18 @@ func (r *Queryer) QueryStateAfterEvents(
 	}
 	response.PrevEventsExist = true
 
-	// Look up the currrent state for the requested tuples.
-	stateEntries, err := roomState.LoadStateAfterEventsForStringTuples(
-		ctx, prevStates, request.StateToFetch,
-	)
+	var stateEntries []types.StateEntry
+	if len(request.StateToFetch) == 0 {
+		// Look up all of the current room state.
+		stateEntries, err = roomState.LoadCombinedStateAfterEvents(
+			ctx, prevStates,
+		)
+	} else {
+		// Look up the current state for the requested tuples.
+		stateEntries, err = roomState.LoadStateAfterEventsForStringTuples(
+			ctx, prevStates, request.StateToFetch,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -89,6 +98,24 @@ func (r *Queryer) QueryStateAfterEvents(
 	stateEvents, err := helpers.LoadStateEvents(ctx, r.DB, stateEntries)
 	if err != nil {
 		return err
+	}
+
+	if len(request.PrevEventIDs) > 1 && len(request.StateToFetch) == 0 {
+		var authEventIDs []string
+		for _, e := range stateEvents {
+			authEventIDs = append(authEventIDs, e.AuthEventIDs()...)
+		}
+		authEventIDs = util.UniqueStrings(authEventIDs)
+
+		authEvents, err := GetAuthChain(ctx, r.DB.EventsFromIDs, authEventIDs)
+		if err != nil {
+			return fmt.Errorf("getAuthChain: %w", err)
+		}
+
+		stateEvents, err = gomatrixserverlib.ResolveConflicts(info.RoomVersion, stateEvents, authEvents)
+		if err != nil {
+			return fmt.Errorf("state.ResolveConflictsAdhoc: %w", err)
+		}
 	}
 
 	for _, event := range stateEvents {
@@ -122,7 +149,7 @@ func (r *Queryer) QueryMissingAuthPrevEvents(
 	}
 
 	for _, prevEventID := range request.PrevEventIDs {
-		if nids, err := r.DB.EventNIDs(ctx, []string{prevEventID}); err != nil || len(nids) == 0 {
+		if state, err := r.DB.StateAtEventIDs(ctx, []string{prevEventID}); err != nil || len(state) == 0 {
 			response.MissingPrevEventIDs = append(response.MissingPrevEventIDs, prevEventID)
 		}
 	}
@@ -177,10 +204,12 @@ func (r *Queryer) QueryMembershipForUser(
 		return fmt.Errorf("QueryMembershipForUser: unknown room %s", request.RoomID)
 	}
 
-	membershipEventNID, stillInRoom, err := r.DB.GetMembership(ctx, info.RoomNID, request.UserID)
+	membershipEventNID, stillInRoom, isRoomforgotten, err := r.DB.GetMembership(ctx, info.RoomNID, request.UserID)
 	if err != nil {
 		return err
 	}
+
+	response.IsRoomForgotten = isRoomforgotten
 
 	if membershipEventNID == 0 {
 		response.HasBeenInRoom = false
@@ -213,11 +242,37 @@ func (r *Queryer) QueryMembershipsForRoom(
 	if err != nil {
 		return err
 	}
+	if info == nil {
+		return nil
+	}
 
-	membershipEventNID, stillInRoom, err := r.DB.GetMembership(ctx, info.RoomNID, request.Sender)
+	// If no sender is specified then we will just return the entire
+	// set of memberships for the room, regardless of whether a specific
+	// user is allowed to see them or not.
+	if request.Sender == "" {
+		var events []types.Event
+		var eventNIDs []types.EventNID
+		eventNIDs, err = r.DB.GetMembershipEventNIDsForRoom(ctx, info.RoomNID, request.JoinedOnly, false)
+		if err != nil {
+			return fmt.Errorf("r.DB.GetMembershipEventNIDsForRoom: %w", err)
+		}
+		events, err = r.DB.Events(ctx, eventNIDs)
+		if err != nil {
+			return fmt.Errorf("r.DB.Events: %w", err)
+		}
+		for _, event := range events {
+			clientEvent := gomatrixserverlib.ToClientEvent(event.Event, gomatrixserverlib.FormatAll)
+			response.JoinEvents = append(response.JoinEvents, clientEvent)
+		}
+		return nil
+	}
+
+	membershipEventNID, stillInRoom, isRoomforgotten, err := r.DB.GetMembership(ctx, info.RoomNID, request.Sender)
 	if err != nil {
 		return err
 	}
+
+	response.IsRoomForgotten = isRoomforgotten
 
 	if membershipEventNID == 0 {
 		response.HasBeenInRoom = false
@@ -274,6 +329,16 @@ func (r *Queryer) QueryServerJoinedToRoom(
 	}
 	response.RoomExists = true
 
+	if request.ServerName == r.ServerName || request.ServerName == "" {
+		var joined bool
+		joined, err = r.DB.GetLocalServerInRoom(ctx, info.RoomNID)
+		if err != nil {
+			return fmt.Errorf("r.DB.GetLocalServerInRoom: %w", err)
+		}
+		response.IsInRoom = joined
+		return nil
+	}
+
 	eventNIDs, err := r.DB.GetMembershipEventNIDsForRoom(ctx, info.RoomNID, true, false)
 	if err != nil {
 		return fmt.Errorf("r.DB.GetMembershipEventNIDsForRoom: %w", err)
@@ -323,10 +388,16 @@ func (r *Queryer) QueryServerAllowedToSeeEvent(
 		return
 	}
 	roomID := events[0].RoomID()
-	isServerInRoom, err := helpers.IsServerCurrentlyInRoom(ctx, r.DB, request.ServerName, roomID)
-	if err != nil {
-		return
+
+	inRoomReq := &api.QueryServerJoinedToRoomRequest{
+		RoomID:     roomID,
+		ServerName: request.ServerName,
 	}
+	inRoomRes := &api.QueryServerJoinedToRoomResponse{}
+	if err = r.QueryServerJoinedToRoom(ctx, inRoomReq, inRoomRes); err != nil {
+		return fmt.Errorf("r.Queryer.QueryServerJoinedToRoom: %w", err)
+	}
+
 	info, err := r.DB.RoomInfo(ctx, roomID)
 	if err != nil {
 		return err
@@ -335,13 +406,12 @@ func (r *Queryer) QueryServerAllowedToSeeEvent(
 		return fmt.Errorf("QueryServerAllowedToSeeEvent: no room info for room %s", roomID)
 	}
 	response.AllowedToSeeEvent, err = helpers.CheckServerAllowedToSeeEvent(
-		ctx, r.DB, *info, request.EventID, request.ServerName, isServerInRoom,
+		ctx, r.DB, *info, request.EventID, request.ServerName, inRoomRes.IsInRoom,
 	)
 	return
 }
 
 // QueryMissingEvents implements api.RoomserverInternalAPI
-// nolint:gocyclo
 func (r *Queryer) QueryMissingEvents(
 	ctx context.Context,
 	request *api.QueryMissingEventsRequest,
@@ -385,7 +455,7 @@ func (r *Queryer) QueryMissingEvents(
 		return err
 	}
 
-	response.Events = make([]gomatrixserverlib.HeaderedEvent, 0, len(loadedEvents)-len(eventsToFilter))
+	response.Events = make([]*gomatrixserverlib.HeaderedEvent, 0, len(loadedEvents)-len(eventsToFilter))
 	for _, event := range loadedEvents {
 		if !eventsToFilter[event.EventID()] {
 			roomVersion, verr := r.roomVersion(event.RoomID())
@@ -416,10 +486,12 @@ func (r *Queryer) QueryStateAndAuthChain(
 	response.RoomExists = true
 	response.RoomVersion = info.RoomVersion
 
-	stateEvents, err := r.loadStateAtEventIDs(ctx, *info, request.PrevEventIDs)
+	var stateEvents []*gomatrixserverlib.Event
+	stateEvents, err = r.loadStateAtEventIDs(ctx, *info, request.PrevEventIDs)
 	if err != nil {
 		return err
 	}
+
 	response.PrevEventsExist = true
 
 	// add the auth event IDs for the current state events too
@@ -430,13 +502,13 @@ func (r *Queryer) QueryStateAndAuthChain(
 	}
 	authEventIDs = util.UniqueStrings(authEventIDs) // de-dupe
 
-	authEvents, err := getAuthChain(ctx, r.DB.EventsFromIDs, authEventIDs)
+	authEvents, err := GetAuthChain(ctx, r.DB.EventsFromIDs, authEventIDs)
 	if err != nil {
 		return err
 	}
 
 	if request.ResolveState {
-		if stateEvents, err = state.ResolveConflictsAdhoc(
+		if stateEvents, err = gomatrixserverlib.ResolveConflicts(
 			info.RoomVersion, stateEvents, authEvents,
 		); err != nil {
 			return err
@@ -454,7 +526,7 @@ func (r *Queryer) QueryStateAndAuthChain(
 	return err
 }
 
-func (r *Queryer) loadStateAtEventIDs(ctx context.Context, roomInfo types.RoomInfo, eventIDs []string) ([]gomatrixserverlib.Event, error) {
+func (r *Queryer) loadStateAtEventIDs(ctx context.Context, roomInfo types.RoomInfo, eventIDs []string) ([]*gomatrixserverlib.Event, error) {
 	roomState := state.NewStateResolution(r.DB, roomInfo)
 	prevStates, err := r.DB.StateAtEventIDs(ctx, eventIDs)
 	if err != nil {
@@ -479,19 +551,19 @@ func (r *Queryer) loadStateAtEventIDs(ctx context.Context, roomInfo types.RoomIn
 
 type eventsFromIDs func(context.Context, []string) ([]types.Event, error)
 
-// getAuthChain fetches the auth chain for the given auth events. An auth chain
+// GetAuthChain fetches the auth chain for the given auth events. An auth chain
 // is the list of all events that are referenced in the auth_events section, and
 // all their auth_events, recursively. The returned set of events contain the
 // given events. Will *not* error if we don't have all auth events.
-func getAuthChain(
+func GetAuthChain(
 	ctx context.Context, fn eventsFromIDs, authEventIDs []string,
-) ([]gomatrixserverlib.Event, error) {
+) ([]*gomatrixserverlib.Event, error) {
 	// List of event IDs to fetch. On each pass, these events will be requested
 	// from the database and the `eventsToFetch` will be updated with any new
 	// events that we have learned about and need to find. When `eventsToFetch`
 	// is eventually empty, we should have reached the end of the chain.
 	eventsToFetch := authEventIDs
-	authEventsMap := make(map[string]gomatrixserverlib.Event)
+	authEventsMap := make(map[string]*gomatrixserverlib.Event)
 
 	for len(eventsToFetch) > 0 {
 		// Try to retrieve the events from the database.
@@ -522,7 +594,7 @@ func getAuthChain(
 
 	// We've now retrieved all of the events we can. Flatten them down into an
 	// array and return them.
-	var authEvents []gomatrixserverlib.Event
+	var authEvents []*gomatrixserverlib.Event
 	for _, event := range authEventsMap {
 		authEvents = append(authEvents, event)
 	}
@@ -683,5 +755,18 @@ func (r *Queryer) QueryServerBannedFromRoom(ctx context.Context, req *api.QueryS
 		return errors.New("no server ACL tracking")
 	}
 	res.Banned = r.ServerACLs.IsServerBannedFromRoom(req.ServerName, req.RoomID)
+	return nil
+}
+
+func (r *Queryer) QueryAuthChain(ctx context.Context, req *api.QueryAuthChainRequest, res *api.QueryAuthChainResponse) error {
+	chain, err := GetAuthChain(ctx, r.DB.EventsFromIDs, req.EventIDs)
+	if err != nil {
+		return err
+	}
+	hchain := make([]*gomatrixserverlib.HeaderedEvent, len(chain))
+	for i := range chain {
+		hchain[i] = chain[i].Headered(chain[i].Version())
+	}
+	res.AuthChain = hchain
 	return nil
 }

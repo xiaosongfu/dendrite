@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/dendrite/roomserver/auth"
@@ -49,6 +50,10 @@ func UpdateToInviteMembership(
 	return updates, nil
 }
 
+// IsServerCurrentlyInRoom checks if a server is in a given room, based on the room
+// memberships. If the servername is not supplied then the local server will be
+// checked instead using a faster code path.
+// TODO: This should probably be replaced by an API call.
 func IsServerCurrentlyInRoom(ctx context.Context, db storage.Database, serverName gomatrixserverlib.ServerName, roomID string) (bool, error) {
 	info, err := db.RoomInfo(ctx, roomID)
 	if err != nil {
@@ -56,6 +61,10 @@ func IsServerCurrentlyInRoom(ctx context.Context, db storage.Database, serverNam
 	}
 	if info == nil {
 		return false, fmt.Errorf("unknown room %s", roomID)
+	}
+
+	if serverName == "" {
+		return db.GetLocalServerInRoom(ctx, info.RoomNID)
 	}
 
 	eventNIDs, err := db.GetMembershipEventNIDsForRoom(ctx, info.RoomNID, true, false)
@@ -67,7 +76,7 @@ func IsServerCurrentlyInRoom(ctx context.Context, db storage.Database, serverNam
 	if err != nil {
 		return false, err
 	}
-	gmslEvents := make([]gomatrixserverlib.Event, len(events))
+	gmslEvents := make([]*gomatrixserverlib.Event, len(events))
 	for i := range events {
 		gmslEvents[i] = events[i].Event
 	}
@@ -190,13 +199,13 @@ func StateBeforeEvent(ctx context.Context, db storage.Database, info types.RoomI
 
 func LoadEvents(
 	ctx context.Context, db storage.Database, eventNIDs []types.EventNID,
-) ([]gomatrixserverlib.Event, error) {
+) ([]*gomatrixserverlib.Event, error) {
 	stateEvents, err := db.Events(ctx, eventNIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	result := make([]gomatrixserverlib.Event, len(stateEvents))
+	result := make([]*gomatrixserverlib.Event, len(stateEvents))
 	for i := range stateEvents {
 		result[i] = stateEvents[i].Event
 	}
@@ -205,7 +214,7 @@ func LoadEvents(
 
 func LoadStateEvents(
 	ctx context.Context, db storage.Database, stateEntries []types.StateEntry,
-) ([]gomatrixserverlib.Event, error) {
+) ([]*gomatrixserverlib.Event, error) {
 	eventNIDs := make([]types.EventNID, len(stateEntries))
 	for i := range stateEntries {
 		eventNIDs[i] = stateEntries[i].EventNID
@@ -222,12 +231,45 @@ func CheckServerAllowedToSeeEvent(
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("roomState.LoadStateAtEvent: %w", err)
 	}
 
-	// TODO: We probably want to make it so that we don't have to pull
-	// out all the state if possible.
-	stateAtEvent, err := LoadStateEvents(ctx, db, stateEntries)
+	// Extract all of the event state key NIDs from the room state.
+	var stateKeyNIDs []types.EventStateKeyNID
+	for _, entry := range stateEntries {
+		stateKeyNIDs = append(stateKeyNIDs, entry.EventStateKeyNID)
+	}
+
+	// Then request those state key NIDs from the database.
+	stateKeys, err := db.EventStateKeys(ctx, stateKeyNIDs)
+	if err != nil {
+		return false, fmt.Errorf("db.EventStateKeys: %w", err)
+	}
+
+	// If the event state key doesn't match the given servername
+	// then we'll filter it out. This does preserve state keys that
+	// are "" since these will contain history visibility etc.
+	for nid, key := range stateKeys {
+		if key != "" && !strings.HasSuffix(key, ":"+string(serverName)) {
+			delete(stateKeys, nid)
+		}
+	}
+
+	// Now filter through all of the state events for the room.
+	// If the state key NID appears in the list of valid state
+	// keys then we'll add it to the list of filtered entries.
+	var filteredEntries []types.StateEntry
+	for _, entry := range stateEntries {
+		if _, ok := stateKeys[entry.EventStateKeyNID]; ok {
+			filteredEntries = append(filteredEntries, entry)
+		}
+	}
+
+	if len(filteredEntries) == 0 {
+		return false, nil
+	}
+
+	stateAtEvent, err := LoadStateEvents(ctx, db, filteredEntries)
 	if err != nil {
 		return false, err
 	}
@@ -236,7 +278,6 @@ func CheckServerAllowedToSeeEvent(
 }
 
 // TODO: Remove this when we have tests to assert correctness of this function
-// nolint:gocyclo
 func ScanEventTree(
 	ctx context.Context, db storage.Database, info types.RoomInfo, front []string, visited map[string]bool, limit int,
 	serverName gomatrixserverlib.ServerName,

@@ -24,13 +24,14 @@ import (
 
 // SendEvents to the roomserver The events are written with KindNew.
 func SendEvents(
-	ctx context.Context, rsAPI RoomserverInternalAPI, events []gomatrixserverlib.HeaderedEvent,
+	ctx context.Context, rsAPI RoomserverInternalAPI,
+	kind Kind, events []*gomatrixserverlib.HeaderedEvent,
 	sendAsServer gomatrixserverlib.ServerName, txnID *TransactionID,
 ) error {
 	ires := make([]InputRoomEvent, len(events))
 	for i, event := range events {
 		ires[i] = InputRoomEvent{
-			Kind:          KindNew,
+			Kind:          kind,
 			Event:         event,
 			AuthEventIDs:  event.AuthEventIDs(),
 			SendAsServer:  string(sendAsServer),
@@ -40,12 +41,13 @@ func SendEvents(
 	return SendInputRoomEvents(ctx, rsAPI, ires)
 }
 
-// SendEventWithState writes an event with KindNew to the roomserver
+// SendEventWithState writes an event with the specified kind to the roomserver
 // with the state at the event as KindOutlier before it. Will not send any event that is
-// marked as `true` in haveEventIDs
+// marked as `true` in haveEventIDs.
 func SendEventWithState(
-	ctx context.Context, rsAPI RoomserverInternalAPI, state *gomatrixserverlib.RespState,
-	event gomatrixserverlib.HeaderedEvent, haveEventIDs map[string]bool,
+	ctx context.Context, rsAPI RoomserverInternalAPI, kind Kind,
+	state *gomatrixserverlib.RespState, event *gomatrixserverlib.HeaderedEvent,
+	haveEventIDs map[string]bool,
 ) error {
 	outliers, err := state.Events()
 	if err != nil {
@@ -70,7 +72,7 @@ func SendEventWithState(
 	}
 
 	ires = append(ires, InputRoomEvent{
-		Kind:          KindNew,
+		Kind:          kind,
 		Event:         event,
 		AuthEventIDs:  event.AuthEventIDs(),
 		HasState:      true,
@@ -95,7 +97,7 @@ func SendInputRoomEvents(
 // If we are in the room then the event should be sent using the SendEvents method.
 func SendInvite(
 	ctx context.Context,
-	rsAPI RoomserverInternalAPI, inviteEvent gomatrixserverlib.HeaderedEvent,
+	rsAPI RoomserverInternalAPI, inviteEvent *gomatrixserverlib.HeaderedEvent,
 	inviteRoomState []gomatrixserverlib.InviteV2StrippedState,
 	sendAsServer gomatrixserverlib.ServerName, txnID *TransactionID,
 ) error {
@@ -132,7 +134,7 @@ func GetEvent(ctx context.Context, rsAPI RoomserverInternalAPI, eventID string) 
 	if len(res.Events) != 1 {
 		return nil
 	}
-	return &res.Events[0]
+	return res.Events[0]
 }
 
 // GetStateEvent returns the current state event in the room or nil.
@@ -170,7 +172,6 @@ func IsServerBannedFromRoom(ctx context.Context, rsAPI RoomserverInternalAPI, ro
 // PopulatePublicRooms extracts PublicRoom information for all the provided room IDs. The IDs are not checked to see if they are visible in the
 // published room directory.
 // due to lots of switches
-// nolint:gocyclo
 func PopulatePublicRooms(ctx context.Context, roomIDs []string, rsAPI RoomserverInternalAPI) ([]gomatrixserverlib.PublicRoom, error) {
 	avatarTuple := gomatrixserverlib.StateKeyTuple{EventType: "m.room.avatar", StateKey: ""}
 	nameTuple := gomatrixserverlib.StateKeyTuple{EventType: "m.room.name", StateKey: ""}

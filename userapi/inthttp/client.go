@@ -32,8 +32,10 @@ const (
 	PerformAccountCreationPath     = "/userapi/performAccountCreation"
 	PerformPasswordUpdatePath      = "/userapi/performPasswordUpdate"
 	PerformDeviceDeletionPath      = "/userapi/performDeviceDeletion"
+	PerformLastSeenUpdatePath      = "/userapi/performLastSeenUpdate"
 	PerformDeviceUpdatePath        = "/userapi/performDeviceUpdate"
 	PerformAccountDeactivationPath = "/userapi/performAccountDeactivation"
+	PerformOpenIDTokenCreationPath = "/userapi/performOpenIDTokenCreation"
 
 	QueryProfilePath        = "/userapi/queryProfile"
 	QueryAccessTokenPath    = "/userapi/queryAccessToken"
@@ -41,6 +43,7 @@ const (
 	QueryAccountDataPath    = "/userapi/queryAccountData"
 	QueryDeviceInfosPath    = "/userapi/queryDeviceInfos"
 	QuerySearchProfilesPath = "/userapi/querySearchProfiles"
+	QueryOpenIDTokenPath    = "/userapi/queryOpenIDToken"
 )
 
 // NewUserAPIClient creates a UserInternalAPI implemented by talking to a HTTP POST API.
@@ -119,6 +122,18 @@ func (h *httpUserInternalAPI) PerformDeviceDeletion(
 	return httputil.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
 }
 
+func (h *httpUserInternalAPI) PerformLastSeenUpdate(
+	ctx context.Context,
+	req *api.PerformLastSeenUpdateRequest,
+	res *api.PerformLastSeenUpdateResponse,
+) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "PerformLastSeen")
+	defer span.Finish()
+
+	apiURL := h.apiURL + PerformLastSeenUpdatePath
+	return httputil.PostJSON(ctx, span, h.httpClient, apiURL, req, res)
+}
+
 func (h *httpUserInternalAPI) PerformDeviceUpdate(ctx context.Context, req *api.PerformDeviceUpdateRequest, res *api.PerformDeviceUpdateResponse) error {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "PerformDeviceUpdate")
 	defer span.Finish()
@@ -133,6 +148,14 @@ func (h *httpUserInternalAPI) PerformAccountDeactivation(ctx context.Context, re
 
 	apiURL := h.apiURL + PerformAccountDeactivationPath
 	return httputil.PostJSON(ctx, span, h.httpClient, apiURL, req, res)
+}
+
+func (h *httpUserInternalAPI) PerformOpenIDTokenCreation(ctx context.Context, request *api.PerformOpenIDTokenCreationRequest, response *api.PerformOpenIDTokenCreationResponse) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "PerformOpenIDTokenCreation")
+	defer span.Finish()
+
+	apiURL := h.apiURL + PerformOpenIDTokenCreationPath
+	return httputil.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
 }
 
 func (h *httpUserInternalAPI) QueryProfile(
@@ -192,5 +215,13 @@ func (h *httpUserInternalAPI) QuerySearchProfiles(ctx context.Context, req *api.
 	defer span.Finish()
 
 	apiURL := h.apiURL + QuerySearchProfilesPath
+	return httputil.PostJSON(ctx, span, h.httpClient, apiURL, req, res)
+}
+
+func (h *httpUserInternalAPI) QueryOpenIDToken(ctx context.Context, req *api.QueryOpenIDTokenRequest, res *api.QueryOpenIDTokenResponse) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "QueryOpenIDToken")
+	defer span.Finish()
+
+	apiURL := h.apiURL + QueryOpenIDTokenPath
 	return httputil.PostJSON(ctx, span, h.httpClient, apiURL, req, res)
 }

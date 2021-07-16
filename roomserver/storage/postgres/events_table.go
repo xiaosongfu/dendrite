@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 
 	"github.com/lib/pq"
 	"github.com/matrix-org/dendrite/internal"
@@ -88,6 +89,16 @@ const bulkSelectStateEventByIDSQL = "" +
 	" WHERE event_id = ANY($1)" +
 	" ORDER BY event_type_nid, event_state_key_nid ASC"
 
+// Bulk look up of events by event NID, optionally filtering by the event type
+// or event state key NIDs if provided. (The CARDINALITY check will return true
+// if the provided arrays are empty, ergo no filtering).
+const bulkSelectStateEventByNIDSQL = "" +
+	"SELECT event_type_nid, event_state_key_nid, event_nid FROM roomserver_events" +
+	" WHERE event_nid = ANY($1)" +
+	" AND (CARDINALITY($2::bigint[]) = 0 OR event_type_nid = ANY($2))" +
+	" AND (CARDINALITY($3::bigint[]) = 0 OR event_state_key_nid = ANY($3))" +
+	" ORDER BY event_type_nid, event_state_key_nid ASC"
+
 const bulkSelectStateAtEventByIDSQL = "" +
 	"SELECT event_type_nid, event_state_key_nid, event_nid, state_snapshot_nid, is_rejected FROM roomserver_events" +
 	" WHERE event_id = ANY($1)"
@@ -120,13 +131,14 @@ const bulkSelectEventNIDSQL = "" +
 const selectMaxEventDepthSQL = "" +
 	"SELECT COALESCE(MAX(depth) + 1, 0) FROM roomserver_events WHERE event_nid = ANY($1)"
 
-const selectRoomNIDForEventNIDSQL = "" +
-	"SELECT room_nid FROM roomserver_events WHERE event_nid = $1"
+const selectRoomNIDsForEventNIDsSQL = "" +
+	"SELECT event_nid, room_nid FROM roomserver_events WHERE event_nid = ANY($1)"
 
 type eventStatements struct {
 	insertEventStmt                        *sql.Stmt
 	selectEventStmt                        *sql.Stmt
 	bulkSelectStateEventByIDStmt           *sql.Stmt
+	bulkSelectStateEventByNIDStmt          *sql.Stmt
 	bulkSelectStateAtEventByIDStmt         *sql.Stmt
 	updateEventStateStmt                   *sql.Stmt
 	selectEventSentToOutputStmt            *sql.Stmt
@@ -137,20 +149,22 @@ type eventStatements struct {
 	bulkSelectEventIDStmt                  *sql.Stmt
 	bulkSelectEventNIDStmt                 *sql.Stmt
 	selectMaxEventDepthStmt                *sql.Stmt
-	selectRoomNIDForEventNIDStmt           *sql.Stmt
+	selectRoomNIDsForEventNIDsStmt         *sql.Stmt
 }
 
-func NewPostgresEventsTable(db *sql.DB) (tables.Events, error) {
-	s := &eventStatements{}
+func createEventsTable(db *sql.DB) error {
 	_, err := db.Exec(eventsSchema)
-	if err != nil {
-		return nil, err
-	}
+	return err
+}
+
+func prepareEventsTable(db *sql.DB) (tables.Events, error) {
+	s := &eventStatements{}
 
 	return s, shared.StatementList{
 		{&s.insertEventStmt, insertEventSQL},
 		{&s.selectEventStmt, selectEventSQL},
 		{&s.bulkSelectStateEventByIDStmt, bulkSelectStateEventByIDSQL},
+		{&s.bulkSelectStateEventByNIDStmt, bulkSelectStateEventByNIDSQL},
 		{&s.bulkSelectStateAtEventByIDStmt, bulkSelectStateAtEventByIDSQL},
 		{&s.updateEventStateStmt, updateEventStateSQL},
 		{&s.updateEventSentToOutputStmt, updateEventSentToOutputSQL},
@@ -161,7 +175,7 @@ func NewPostgresEventsTable(db *sql.DB) (tables.Events, error) {
 		{&s.bulkSelectEventIDStmt, bulkSelectEventIDSQL},
 		{&s.bulkSelectEventNIDStmt, bulkSelectEventNIDSQL},
 		{&s.selectMaxEventDepthStmt, selectMaxEventDepthSQL},
-		{&s.selectRoomNIDForEventNIDStmt, selectRoomNIDForEventNIDSQL},
+		{&s.selectRoomNIDsForEventNIDsStmt, selectRoomNIDsForEventNIDsSQL},
 	}.Prepare(db)
 }
 
@@ -236,6 +250,42 @@ func (s *eventStatements) BulkSelectStateEventByID(
 		)
 	}
 	return results, nil
+}
+
+// bulkSelectStateEventByNID lookups a list of state events by event NID.
+// If any of the requested events are missing from the database it returns a types.MissingEventError
+func (s *eventStatements) BulkSelectStateEventByNID(
+	ctx context.Context, eventNIDs []types.EventNID,
+	stateKeyTuples []types.StateKeyTuple,
+) ([]types.StateEntry, error) {
+	tuples := stateKeyTupleSorter(stateKeyTuples)
+	sort.Sort(tuples)
+	eventTypeNIDArray, eventStateKeyNIDArray := tuples.typesAndStateKeysAsArrays()
+	rows, err := s.bulkSelectStateEventByNIDStmt.QueryContext(ctx, eventNIDsAsArray(eventNIDs), eventTypeNIDArray, eventStateKeyNIDArray)
+	if err != nil {
+		return nil, err
+	}
+	defer internal.CloseAndLogIfError(ctx, rows, "bulkSelectStateEventByID: rows.close() failed")
+	// We know that we will only get as many results as event IDs
+	// because of the unique constraint on event IDs.
+	// So we can allocate an array of the correct size now.
+	// We might get fewer results than IDs so we adjust the length of the slice before returning it.
+	results := make([]types.StateEntry, len(eventNIDs))
+	i := 0
+	for ; rows.Next(); i++ {
+		result := &results[i]
+		if err = rows.Scan(
+			&result.EventTypeNID,
+			&result.EventStateKeyNID,
+			&result.EventNID,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return results[:i], nil
 }
 
 // bulkSelectStateAtEventByID lookups the state at a list of events by event ID.
@@ -432,11 +482,24 @@ func (s *eventStatements) SelectMaxEventDepth(ctx context.Context, txn *sql.Tx, 
 	return result, nil
 }
 
-func (s *eventStatements) SelectRoomNIDForEventNID(
-	ctx context.Context, eventNID types.EventNID,
-) (roomNID types.RoomNID, err error) {
-	err = s.selectRoomNIDForEventNIDStmt.QueryRowContext(ctx, int64(eventNID)).Scan(&roomNID)
-	return
+func (s *eventStatements) SelectRoomNIDsForEventNIDs(
+	ctx context.Context, eventNIDs []types.EventNID,
+) (map[types.EventNID]types.RoomNID, error) {
+	rows, err := s.selectRoomNIDsForEventNIDsStmt.QueryContext(ctx, eventNIDsAsArray(eventNIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer internal.CloseAndLogIfError(ctx, rows, "selectRoomNIDsForEventNIDsStmt: rows.close() failed")
+	result := make(map[types.EventNID]types.RoomNID)
+	for rows.Next() {
+		var eventNID types.EventNID
+		var roomNID types.RoomNID
+		if err = rows.Scan(&eventNID, &roomNID); err != nil {
+			return nil, err
+		}
+		result[eventNID] = roomNID
+	}
+	return result, nil
 }
 
 func eventNIDsAsArray(eventNIDs []types.EventNID) pq.Int64Array {

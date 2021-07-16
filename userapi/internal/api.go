@@ -23,9 +23,9 @@ import (
 
 	"github.com/matrix-org/dendrite/appservice/types"
 	"github.com/matrix-org/dendrite/clientapi/userutil"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	keyapi "github.com/matrix-org/dendrite/keyserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
 	"github.com/matrix-org/dendrite/userapi/storage/devices"
@@ -113,7 +113,7 @@ func (a *UserInternalAPI) PerformDeviceCreation(ctx context.Context, req *api.Pe
 		"device_id":    req.DeviceID,
 		"display_name": req.DeviceDisplayName,
 	}).Info("PerformDeviceCreation")
-	dev, err := a.DeviceDB.CreateDevice(ctx, req.Localpart, req.DeviceID, req.AccessToken, req.DeviceDisplayName)
+	dev, err := a.DeviceDB.CreateDevice(ctx, req.Localpart, req.DeviceID, req.AccessToken, req.DeviceDisplayName, req.IPAddr, req.UserAgent)
 	if err != nil {
 		return err
 	}
@@ -161,6 +161,7 @@ func (a *UserInternalAPI) deviceListUpdate(userID string, deviceIDs []string) er
 
 	var uploadRes keyapi.PerformUploadKeysResponse
 	a.KeyAPI.PerformUploadKeys(context.Background(), &keyapi.PerformUploadKeysRequest{
+		UserID:     userID,
 		DeviceKeys: deviceKeys,
 	}, &uploadRes)
 	if uploadRes.Error != nil {
@@ -168,6 +169,21 @@ func (a *UserInternalAPI) deviceListUpdate(userID string, deviceIDs []string) er
 	}
 	if len(uploadRes.KeyErrors) > 0 {
 		return fmt.Errorf("Failed to delete device keys, key errors: %+v", uploadRes.KeyErrors)
+	}
+	return nil
+}
+
+func (a *UserInternalAPI) PerformLastSeenUpdate(
+	ctx context.Context,
+	req *api.PerformLastSeenUpdateRequest,
+	res *api.PerformLastSeenUpdateResponse,
+) error {
+	localpart, _, err := gomatrixserverlib.SplitID('@', req.UserID)
+	if err != nil {
+		return fmt.Errorf("gomatrixserverlib.SplitID: %w", err)
+	}
+	if err := a.DeviceDB.UpdateDeviceLastSeen(ctx, localpart, req.DeviceID, req.RemoteAddr); err != nil {
+		return fmt.Errorf("a.DeviceDB.UpdateDeviceLastSeen: %w", err)
 	}
 	return nil
 }
@@ -202,6 +218,7 @@ func (a *UserInternalAPI) PerformDeviceUpdate(ctx context.Context, req *api.Perf
 		// display name has changed: update the device key
 		var uploadRes keyapi.PerformUploadKeysResponse
 		a.KeyAPI.PerformUploadKeys(context.Background(), &keyapi.PerformUploadKeysRequest{
+			UserID: req.RequestingUserID,
 			DeviceKeys: []keyapi.DeviceKeys{
 				{
 					DeviceID:    dev.ID,
@@ -364,7 +381,8 @@ func (a *UserInternalAPI) queryAppServiceToken(ctx context.Context, token, appSe
 		// Use AS dummy device ID
 		ID: types.AppServiceDeviceID,
 		// AS dummy device has AS's token.
-		AccessToken: token,
+		AccessToken:  token,
+		AppserviceID: appService.ID,
 	}
 
 	localpart, err := userutil.ParseUsernameParam(appServiceUserID, &a.ServerName)
@@ -375,8 +393,9 @@ func (a *UserInternalAPI) queryAppServiceToken(ctx context.Context, token, appSe
 	if localpart != "" { // AS is masquerading as another user
 		// Verify that the user is registered
 		account, err := a.AccountDB.GetAccountByLocalpart(ctx, localpart)
-		// Verify that account exists & appServiceID matches
-		if err == nil && account.AppServiceID == appService.ID {
+		// Verify that the account exists and either appServiceID matches or
+		// it belongs to the appservice user namespaces
+		if err == nil && (account.AppServiceID == appService.ID || appService.IsInterestedInUserID(appServiceUserID)) {
 			// Set the userID of dummy device
 			dev.UserID = appServiceUserID
 			return &dev, nil
@@ -394,4 +413,32 @@ func (a *UserInternalAPI) PerformAccountDeactivation(ctx context.Context, req *a
 	err := a.AccountDB.DeactivateAccount(ctx, req.Localpart)
 	res.AccountDeactivated = err == nil
 	return err
+}
+
+// PerformOpenIDTokenCreation creates a new token that a relying party uses to authenticate a user
+func (a *UserInternalAPI) PerformOpenIDTokenCreation(ctx context.Context, req *api.PerformOpenIDTokenCreationRequest, res *api.PerformOpenIDTokenCreationResponse) error {
+	token := util.RandomString(24)
+
+	exp, err := a.AccountDB.CreateOpenIDToken(ctx, token, req.UserID)
+
+	res.Token = api.OpenIDToken{
+		Token:       token,
+		UserID:      req.UserID,
+		ExpiresAtMS: exp,
+	}
+
+	return err
+}
+
+// QueryOpenIDToken validates that the OpenID token was issued for the user, the replying party uses this for validation
+func (a *UserInternalAPI) QueryOpenIDToken(ctx context.Context, req *api.QueryOpenIDTokenRequest, res *api.QueryOpenIDTokenResponse) error {
+	openIDTokenAttrs, err := a.AccountDB.GetOpenIDTokenAttributes(ctx, req.Token)
+	if err != nil {
+		return err
+	}
+
+	res.Sub = openIDTokenAttrs.UserID
+	res.ExpiresAtMS = openIDTokenAttrs.ExpiresAtMS
+
+	return nil
 }

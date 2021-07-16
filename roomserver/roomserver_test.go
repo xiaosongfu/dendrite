@@ -13,11 +13,14 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/matrix-org/dendrite/internal/caching"
-	"github.com/matrix-org/dendrite/internal/config"
-	"github.com/matrix-org/dendrite/internal/setup"
 	"github.com/matrix-org/dendrite/internal/test"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/roomserver/internal"
+	"github.com/matrix-org/dendrite/roomserver/storage"
+	"github.com/matrix-org/dendrite/setup"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -91,7 +94,7 @@ type fledglingEvent struct {
 	RoomID   string
 }
 
-func mustCreateEvents(t *testing.T, roomVer gomatrixserverlib.RoomVersion, events []fledglingEvent) (result []gomatrixserverlib.HeaderedEvent) {
+func mustCreateEvents(t *testing.T, roomVer gomatrixserverlib.RoomVersion, events []fledglingEvent) (result []*gomatrixserverlib.HeaderedEvent) {
 	t.Helper()
 	depth := int64(1)
 	seed := make([]byte, ed25519.SeedSize) // zero seed
@@ -140,16 +143,15 @@ func mustCreateEvents(t *testing.T, roomVer gomatrixserverlib.RoomVersion, event
 	return
 }
 
-func mustLoadRawEvents(t *testing.T, ver gomatrixserverlib.RoomVersion, events []json.RawMessage) []gomatrixserverlib.HeaderedEvent {
+func mustLoadRawEvents(t *testing.T, ver gomatrixserverlib.RoomVersion, events []json.RawMessage) []*gomatrixserverlib.HeaderedEvent {
 	t.Helper()
-	hs := make([]gomatrixserverlib.HeaderedEvent, len(events))
+	hs := make([]*gomatrixserverlib.HeaderedEvent, len(events))
 	for i := range events {
 		e, err := gomatrixserverlib.NewEventFromTrustedJSON(events[i], false, ver)
 		if err != nil {
 			t.Fatalf("cannot load test data: " + err.Error())
 		}
-		h := e.Headered(ver)
-		hs[i] = h
+		hs[i] = e.Headered(ver)
 	}
 	return hs
 }
@@ -160,7 +162,9 @@ func mustCreateRoomserverAPI(t *testing.T) (api.RoomserverInternalAPI, *dummyPro
 	cfg.Defaults()
 	cfg.Global.ServerName = testOrigin
 	cfg.Global.Kafka.UseNaffka = true
-	cfg.RoomServer.Database.ConnectionString = config.DataSource(roomserverDBFileURI)
+	cfg.RoomServer.Database = config.DatabaseOptions{
+		ConnectionString: roomserverDBFileURI,
+	}
 	dp := &dummyProducer{
 		topic: cfg.Global.Kafka.TopicFor(config.TopicOutputRoomEvent),
 	}
@@ -169,19 +173,24 @@ func mustCreateRoomserverAPI(t *testing.T) (api.RoomserverInternalAPI, *dummyPro
 		t.Fatalf("failed to make caches: %s", err)
 	}
 	base := &setup.BaseDendrite{
-		KafkaProducer: dp,
-		Caches:        cache,
-		Cfg:           cfg,
+		Caches: cache,
+		Cfg:    cfg,
 	}
-
-	return NewInternalAPI(base, &test.NopJSONVerifier{}), dp
+	roomserverDB, err := storage.Open(&cfg.RoomServer.Database, base.Caches)
+	if err != nil {
+		logrus.WithError(err).Panicf("failed to connect to room server db")
+	}
+	return internal.NewRoomserverAPI(
+		&cfg.RoomServer, roomserverDB, dp, string(cfg.Global.Kafka.TopicFor(config.TopicOutputRoomEvent)),
+		base.Caches, &test.NopJSONVerifier{}, nil,
+	), dp
 }
 
-func mustSendEvents(t *testing.T, ver gomatrixserverlib.RoomVersion, events []json.RawMessage) (api.RoomserverInternalAPI, *dummyProducer, []gomatrixserverlib.HeaderedEvent) {
+func mustSendEvents(t *testing.T, ver gomatrixserverlib.RoomVersion, events []json.RawMessage) (api.RoomserverInternalAPI, *dummyProducer, []*gomatrixserverlib.HeaderedEvent) {
 	t.Helper()
 	rsAPI, dp := mustCreateRoomserverAPI(t)
 	hevents := mustLoadRawEvents(t, ver, events)
-	if err := api.SendEvents(ctx, rsAPI, hevents, testOrigin, nil); err != nil {
+	if err := api.SendEvents(ctx, rsAPI, api.KindNew, hevents, testOrigin, nil); err != nil {
 		t.Errorf("failed to SendEvents: %s", err)
 	}
 	return rsAPI, dp, hevents
@@ -327,7 +336,7 @@ func TestOutputRewritesState(t *testing.T) {
 	deleteDatabase()
 	rsAPI, producer := mustCreateRoomserverAPI(t)
 	defer deleteDatabase()
-	err := api.SendEvents(context.Background(), rsAPI, originalEvents, testOrigin, nil)
+	err := api.SendEvents(context.Background(), rsAPI, api.KindNew, originalEvents, testOrigin, nil)
 	if err != nil {
 		t.Fatalf("failed to send original events: %s", err)
 	}
@@ -369,7 +378,7 @@ func TestOutputRewritesState(t *testing.T) {
 	if len(producer.producedMessages) != 1 {
 		t.Fatalf("Rewritten events got output, want only 1 got %d", len(producer.producedMessages))
 	}
-	outputEvent := producer.producedMessages[0]
+	outputEvent := producer.producedMessages[len(producer.producedMessages)-1]
 	if !outputEvent.NewRoomEvent.RewritesState {
 		t.Errorf("RewritesState flag not set on output event")
 	}

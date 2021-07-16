@@ -17,15 +17,14 @@ import (
 	"time"
 
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/eventutil"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
 )
 
 // MakeLeave implements the /make_leave API
-// nolint:gocyclo
 func MakeLeave(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
@@ -98,7 +97,7 @@ func MakeLeave(
 	// Check that the leave is allowed or not
 	stateEvents := make([]*gomatrixserverlib.Event, len(queryRes.StateEvents))
 	for i := range queryRes.StateEvents {
-		stateEvents[i] = &queryRes.StateEvents[i].Event
+		stateEvents[i] = queryRes.StateEvents[i].Event
 	}
 	provider := gomatrixserverlib.NewAuthEvents(stateEvents)
 	if err = gomatrixserverlib.Allowed(event.Event, &provider); err != nil {
@@ -118,7 +117,6 @@ func MakeLeave(
 }
 
 // SendLeave implements the /send_leave API
-// nolint:gocyclo
 func SendLeave(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
@@ -256,7 +254,8 @@ func SendLeave(
 	// the room, so set SendAsServer to cfg.Matrix.ServerName
 	if err = api.SendEvents(
 		httpReq.Context(), rsAPI,
-		[]gomatrixserverlib.HeaderedEvent{
+		api.KindNew,
+		[]*gomatrixserverlib.HeaderedEvent{
 			event.Headered(verRes.RoomVersion),
 		},
 		cfg.Matrix.ServerName,

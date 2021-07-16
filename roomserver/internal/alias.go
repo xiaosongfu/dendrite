@@ -23,6 +23,8 @@ import (
 
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/gomatrixserverlib"
+
+	asAPI "github.com/matrix-org/dendrite/appservice/api"
 )
 
 // RoomserverInternalAPIDatabase has the storage APIs needed to implement the alias API.
@@ -86,35 +88,35 @@ func (r *RoomserverInternalAPI) GetRoomIDForAlias(
 ) error {
 	// Look up the room ID in the database
 	roomID, err := r.DB.GetRoomIDForAlias(ctx, request.Alias)
-	if err != nil {
-		return err
+	if err == nil && roomID != "" {
+		response.RoomID = roomID
+		return nil
 	}
 
-	/*
-		TODO: Why is this here? It creates an unnecessary dependency
-		from the roomserver to the appservice component, which should be
-		altogether optional.
+	// Check appservice on err, but only if the appservice API is
+	// wired in and no room ID was found.
+	if r.asAPI != nil && request.IncludeAppservices && roomID == "" {
+		// No room found locally, try our application services by making a call to
+		// the appservice component
+		aliasReq := &asAPI.RoomAliasExistsRequest{
+			Alias: request.Alias,
+		}
+		aliasRes := &asAPI.RoomAliasExistsResponse{}
+		if err = r.asAPI.RoomAliasExists(ctx, aliasReq, aliasRes); err != nil {
+			return err
+		}
 
-		if roomID == "" {
-			// No room found locally, try our application services by making a call to
-			// the appservice component
-			aliasReq := appserviceAPI.RoomAliasExistsRequest{Alias: request.Alias}
-			var aliasResp appserviceAPI.RoomAliasExistsResponse
-			if err = r.AppserviceAPI.RoomAliasExists(ctx, &aliasReq, &aliasResp); err != nil {
+		if aliasRes.AliasExists {
+			roomID, err = r.DB.GetRoomIDForAlias(ctx, request.Alias)
+			if err != nil {
 				return err
 			}
-
-			if aliasResp.AliasExists {
-				roomID, err = r.DB.GetRoomIDForAlias(ctx, request.Alias)
-				if err != nil {
-					return err
-				}
-			}
+			response.RoomID = roomID
+			return nil
 		}
-	*/
+	}
 
-	response.RoomID = roomID
-	return nil
+	return err
 }
 
 // GetAliasesForRoomID implements alias.RoomserverInternalAPI
@@ -229,7 +231,7 @@ func (r *RoomserverInternalAPI) sendUpdatedAliasesEvent(
 	// Add auth events
 	authEvents := gomatrixserverlib.NewAuthEvents(nil)
 	for i := range res.StateEvents {
-		err = authEvents.AddEvent(&res.StateEvents[i].Event)
+		err = authEvents.AddEvent(res.StateEvents[i].Event)
 		if err != nil {
 			return err
 		}

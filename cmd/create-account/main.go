@@ -18,89 +18,125 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"os"
+	"strings"
+	"syscall"
 
-	"github.com/matrix-org/dendrite/internal/config"
+	"github.com/matrix-org/dendrite/setup"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
-	"github.com/matrix-org/dendrite/userapi/storage/devices"
-	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/term"
 )
 
 const usage = `Usage: %s
 
-Generate a new Matrix account for testing purposes.
+Creates a new user account on the homeserver.
+
+Example:
+
+	# provide password by parameter
+  	%s --config dendrite.yaml -username alice -password foobarbaz
+	# use password from file
+  	%s --config dendrite.yaml -username alice -passwordfile my.pass
+	# ask user to provide password
+	%s --config dendrite.yaml -username alice -ask-pass
+	# read password from stdin
+	%s --config dendrite.yaml -username alice -passwordstdin < my.pass
+	cat my.pass | %s --config dendrite.yaml -username alice -passwordstdin
 
 Arguments:
 
 `
 
 var (
-	database      = flag.String("database", "", "The location of the account database.")
-	username      = flag.String("username", "", "The user ID localpart to register e.g 'alice' in '@alice:localhost'.")
-	password      = flag.String("password", "", "Optional. The password to register with. If not specified, this account will be password-less.")
-	serverNameStr = flag.String("servername", "localhost", "The Matrix server domain which will form the domain part of the user ID.")
-	accessToken   = flag.String("token", "", "Optional. The desired access_token to have. If not specified, a random access_token will be made.")
+	username = flag.String("username", "", "The username of the account to register (specify the localpart only, e.g. 'alice' for '@alice:domain.com')")
+	password = flag.String("password", "", "The password to associate with the account (optional, account will be password-less if not specified)")
+	pwdFile  = flag.String("passwordfile", "", "The file to use for the password (e.g. for automated account creation)")
+	pwdStdin = flag.Bool("passwordstdin", false, "Reads the password from stdin")
+	askPass  = flag.Bool("ask-pass", false, "Ask for the password to use")
 )
 
 func main() {
+	name := os.Args[0]
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, usage, os.Args[0])
+		_, _ = fmt.Fprintf(os.Stderr, usage, name, name, name, name, name, name)
 		flag.PrintDefaults()
 	}
-
-	flag.Parse()
+	cfg := setup.ParseFlags(true)
 
 	if *username == "" {
 		flag.Usage()
-		fmt.Println("Missing --username")
 		os.Exit(1)
 	}
 
-	if *database == "" {
-		flag.Usage()
-		fmt.Println("Missing --database")
-		os.Exit(1)
-	}
-
-	serverName := gomatrixserverlib.ServerName(*serverNameStr)
+	pass := getPassword(password, pwdFile, pwdStdin, askPass, os.Stdin)
 
 	accountDB, err := accounts.NewDatabase(&config.DatabaseOptions{
-		ConnectionString: config.DataSource(*database),
-	}, serverName)
+		ConnectionString: cfg.UserAPI.AccountDatabase.ConnectionString,
+	}, cfg.Global.ServerName, bcrypt.DefaultCost, cfg.UserAPI.OpenIDTokenLifetimeMS)
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		logrus.Fatalln("Failed to connect to the database:", err.Error())
 	}
 
-	_, err = accountDB.CreateAccount(context.Background(), *username, *password, "")
+	_, err = accountDB.CreateAccount(context.Background(), *username, pass, "")
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		logrus.Fatalln("Failed to create the account:", err.Error())
 	}
 
-	deviceDB, err := devices.NewDatabase(&config.DatabaseOptions{
-		ConnectionString: config.DataSource(*database),
-	}, serverName)
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+	logrus.Infoln("Created account", *username)
+}
+
+func getPassword(password, pwdFile *string, pwdStdin, askPass *bool, r io.Reader) string {
+	// no password option set, use empty password
+	if password == nil && pwdFile == nil && pwdStdin == nil && askPass == nil {
+		return ""
+	}
+	// password defined as parameter
+	if password != nil && *password != "" {
+		return *password
 	}
 
-	if *accessToken == "" {
-		t := "token_" + *username
-		accessToken = &t
+	// read password from file
+	if pwdFile != nil && *pwdFile != "" {
+		pw, err := ioutil.ReadFile(*pwdFile)
+		if err != nil {
+			logrus.Fatalln("Unable to read password from file:", err)
+		}
+		return strings.TrimSpace(string(pw))
 	}
 
-	device, err := deviceDB.CreateDevice(
-		context.Background(), *username, nil, *accessToken, nil,
-	)
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+	// read password from stdin
+	if pwdStdin != nil && *pwdStdin {
+		data, err := ioutil.ReadAll(r)
+		if err != nil {
+			logrus.Fatalln("Unable to read password from stdin:", err)
+		}
+		return strings.TrimSpace(string(data))
 	}
 
-	fmt.Println("Created account:")
-	fmt.Printf("user_id      = %s\n", device.UserID)
-	fmt.Printf("device_id    = %s\n", device.ID)
-	fmt.Printf("access_token = %s\n", device.AccessToken)
+	// ask the user to provide the password
+	if *askPass {
+		fmt.Print("Enter Password: ")
+		bytePassword, err := term.ReadPassword(syscall.Stdin)
+		if err != nil {
+			logrus.Fatalln("Unable to read password:", err)
+		}
+		fmt.Println()
+		fmt.Print("Confirm Password: ")
+		bytePassword2, err := term.ReadPassword(syscall.Stdin)
+		if err != nil {
+			logrus.Fatalln("Unable to read password:", err)
+		}
+		fmt.Println()
+		if strings.TrimSpace(string(bytePassword)) != strings.TrimSpace(string(bytePassword2)) {
+			logrus.Fatalln("Entered passwords don't match")
+		}
+		return strings.TrimSpace(string(bytePassword))
+	}
+
+	return ""
 }

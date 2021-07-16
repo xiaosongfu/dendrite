@@ -9,8 +9,8 @@ import (
 	"github.com/matrix-org/dendrite/federationsender/queue"
 	"github.com/matrix-org/dendrite/federationsender/statistics"
 	"github.com/matrix-org/dendrite/federationsender/storage"
-	"github.com/matrix-org/dendrite/internal/config"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrix"
 	"github.com/matrix-org/gomatrixserverlib"
 )
@@ -109,6 +109,8 @@ func (a *FederationSenderInternalAPI) doRequest(
 func (a *FederationSenderInternalAPI) GetUserDevices(
 	ctx context.Context, s gomatrixserverlib.ServerName, userID string,
 ) (gomatrixserverlib.RespUserDevices, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
 	ires, err := a.doRequest(s, func() (interface{}, error) {
 		return a.federation.GetUserDevices(ctx, s, userID)
 	})
@@ -121,6 +123,8 @@ func (a *FederationSenderInternalAPI) GetUserDevices(
 func (a *FederationSenderInternalAPI) ClaimKeys(
 	ctx context.Context, s gomatrixserverlib.ServerName, oneTimeKeys map[string]map[string]string,
 ) (gomatrixserverlib.RespClaimKeys, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
 	ires, err := a.doRequest(s, func() (interface{}, error) {
 		return a.federation.ClaimKeys(ctx, s, oneTimeKeys)
 	})
@@ -145,6 +149,8 @@ func (a *FederationSenderInternalAPI) QueryKeys(
 func (a *FederationSenderInternalAPI) Backfill(
 	ctx context.Context, s gomatrixserverlib.ServerName, roomID string, limit int, eventIDs []string,
 ) (res gomatrixserverlib.Transaction, err error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
 	ires, err := a.doRequest(s, func() (interface{}, error) {
 		return a.federation.Backfill(ctx, s, roomID, limit, eventIDs)
 	})
@@ -157,6 +163,8 @@ func (a *FederationSenderInternalAPI) Backfill(
 func (a *FederationSenderInternalAPI) LookupState(
 	ctx context.Context, s gomatrixserverlib.ServerName, roomID, eventID string, roomVersion gomatrixserverlib.RoomVersion,
 ) (res gomatrixserverlib.RespState, err error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
 	ires, err := a.doRequest(s, func() (interface{}, error) {
 		return a.federation.LookupState(ctx, s, roomID, eventID, roomVersion)
 	})
@@ -169,6 +177,8 @@ func (a *FederationSenderInternalAPI) LookupState(
 func (a *FederationSenderInternalAPI) LookupStateIDs(
 	ctx context.Context, s gomatrixserverlib.ServerName, roomID, eventID string,
 ) (res gomatrixserverlib.RespStateIDs, err error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
 	ires, err := a.doRequest(s, func() (interface{}, error) {
 		return a.federation.LookupStateIDs(ctx, s, roomID, eventID)
 	})
@@ -181,6 +191,8 @@ func (a *FederationSenderInternalAPI) LookupStateIDs(
 func (a *FederationSenderInternalAPI) GetEvent(
 	ctx context.Context, s gomatrixserverlib.ServerName, eventID string,
 ) (res gomatrixserverlib.Transaction, err error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
 	ires, err := a.doRequest(s, func() (interface{}, error) {
 		return a.federation.GetEvent(ctx, s, eventID)
 	})
@@ -190,21 +202,11 @@ func (a *FederationSenderInternalAPI) GetEvent(
 	return ires.(gomatrixserverlib.Transaction), nil
 }
 
-func (a *FederationSenderInternalAPI) GetServerKeys(
-	ctx context.Context, s gomatrixserverlib.ServerName,
-) (gomatrixserverlib.ServerKeys, error) {
-	ires, err := a.doRequest(s, func() (interface{}, error) {
-		return a.federation.GetServerKeys(ctx, s)
-	})
-	if err != nil {
-		return gomatrixserverlib.ServerKeys{}, err
-	}
-	return ires.(gomatrixserverlib.ServerKeys), nil
-}
-
 func (a *FederationSenderInternalAPI) LookupServerKeys(
 	ctx context.Context, s gomatrixserverlib.ServerName, keyRequests map[gomatrixserverlib.PublicKeyLookupRequest]gomatrixserverlib.Timestamp,
 ) ([]gomatrixserverlib.ServerKeys, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
 	ires, err := a.doRequest(s, func() (interface{}, error) {
 		return a.federation.LookupServerKeys(ctx, s, keyRequests)
 	})
@@ -212,4 +214,33 @@ func (a *FederationSenderInternalAPI) LookupServerKeys(
 		return []gomatrixserverlib.ServerKeys{}, err
 	}
 	return ires.([]gomatrixserverlib.ServerKeys), nil
+}
+
+func (a *FederationSenderInternalAPI) MSC2836EventRelationships(
+	ctx context.Context, s gomatrixserverlib.ServerName, r gomatrixserverlib.MSC2836EventRelationshipsRequest,
+	roomVersion gomatrixserverlib.RoomVersion,
+) (res gomatrixserverlib.MSC2836EventRelationshipsResponse, err error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	ires, err := a.doRequest(s, func() (interface{}, error) {
+		return a.federation.MSC2836EventRelationships(ctx, s, r, roomVersion)
+	})
+	if err != nil {
+		return res, err
+	}
+	return ires.(gomatrixserverlib.MSC2836EventRelationshipsResponse), nil
+}
+
+func (a *FederationSenderInternalAPI) MSC2946Spaces(
+	ctx context.Context, s gomatrixserverlib.ServerName, roomID string, r gomatrixserverlib.MSC2946SpacesRequest,
+) (res gomatrixserverlib.MSC2946SpacesResponse, err error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	ires, err := a.doRequest(s, func() (interface{}, error) {
+		return a.federation.MSC2946Spaces(ctx, s, roomID, r)
+	})
+	if err != nil {
+		return res, err
+	}
+	return ires.(gomatrixserverlib.MSC2946SpacesResponse), nil
 }

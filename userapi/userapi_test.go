@@ -8,14 +8,15 @@ import (
 	"testing"
 
 	"github.com/gorilla/mux"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/test"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/dendrite/userapi"
 	"github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/dendrite/userapi/inthttp"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
 	"github.com/matrix-org/gomatrixserverlib"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -25,7 +26,7 @@ const (
 func MustMakeInternalAPI(t *testing.T) (api.UserInternalAPI, accounts.Database) {
 	accountDB, err := accounts.NewDatabase(&config.DatabaseOptions{
 		ConnectionString: "file::memory:",
-	}, serverName)
+	}, serverName, bcrypt.MinCost, config.DefaultOpenIDTokenLifetimeMS)
 	if err != nil {
 		t.Fatalf("failed to create account DB: %s", err)
 	}

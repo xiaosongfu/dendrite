@@ -17,14 +17,16 @@ package postgres
 
 import (
 	"database/sql"
-
-	"github.com/matrix-org/dendrite/internal/caching"
-	"github.com/matrix-org/dendrite/internal/config"
-	"github.com/matrix-org/dendrite/internal/sqlutil"
+	"fmt"
 
 	// Import the postgres database driver.
 	_ "github.com/lib/pq"
+
+	"github.com/matrix-org/dendrite/internal/caching"
+	"github.com/matrix-org/dendrite/internal/sqlutil"
+	"github.com/matrix-org/dendrite/roomserver/storage/postgres/deltas"
 	"github.com/matrix-org/dendrite/roomserver/storage/shared"
+	"github.com/matrix-org/dendrite/setup/config"
 )
 
 // A Database is used to store room events and stream offsets.
@@ -33,69 +35,140 @@ type Database struct {
 }
 
 // Open a postgres database.
-// nolint: gocyclo
 func Open(dbProperties *config.DatabaseOptions, cache caching.RoomServerCaches) (*Database, error) {
 	var d Database
 	var db *sql.DB
 	var err error
 	if db, err = sqlutil.Open(dbProperties); err != nil {
+		return nil, fmt.Errorf("sqlutil.Open: %w", err)
+	}
+
+	// Create the tables.
+	if err := d.create(db); err != nil {
 		return nil, err
 	}
-	eventStateKeys, err := NewPostgresEventStateKeysTable(db)
-	if err != nil {
+
+	// Then execute the migrations. By this point the tables are created with the latest
+	// schemas.
+	m := sqlutil.NewMigrations()
+	deltas.LoadAddForgottenColumn(m)
+	deltas.LoadStateBlocksRefactor(m)
+	if err := m.RunDeltas(db, dbProperties); err != nil {
 		return nil, err
 	}
-	eventTypes, err := NewPostgresEventTypesTable(db)
-	if err != nil {
+
+	// Then prepare the statements. Now that the migrations have run, any columns referred
+	// to in the database code should now exist.
+	if err := d.prepare(db, cache); err != nil {
 		return nil, err
 	}
-	eventJSON, err := NewPostgresEventJSONTable(db)
-	if err != nil {
-		return nil, err
+
+	return &d, nil
+}
+
+func (d *Database) create(db *sql.DB) error {
+	if err := createEventStateKeysTable(db); err != nil {
+		return err
 	}
-	events, err := NewPostgresEventsTable(db)
-	if err != nil {
-		return nil, err
+	if err := createEventTypesTable(db); err != nil {
+		return err
 	}
-	rooms, err := NewPostgresRoomsTable(db)
-	if err != nil {
-		return nil, err
+	if err := createEventJSONTable(db); err != nil {
+		return err
 	}
-	transactions, err := NewPostgresTransactionsTable(db)
-	if err != nil {
-		return nil, err
+	if err := createEventsTable(db); err != nil {
+		return err
 	}
-	stateBlock, err := NewPostgresStateBlockTable(db)
-	if err != nil {
-		return nil, err
+	if err := createRoomsTable(db); err != nil {
+		return err
 	}
-	stateSnapshot, err := NewPostgresStateSnapshotTable(db)
-	if err != nil {
-		return nil, err
+	if err := createTransactionsTable(db); err != nil {
+		return err
 	}
-	roomAliases, err := NewPostgresRoomAliasesTable(db)
-	if err != nil {
-		return nil, err
+	if err := createStateBlockTable(db); err != nil {
+		return err
 	}
-	prevEvents, err := NewPostgresPreviousEventsTable(db)
-	if err != nil {
-		return nil, err
+	if err := createStateSnapshotTable(db); err != nil {
+		return err
 	}
-	invites, err := NewPostgresInvitesTable(db)
-	if err != nil {
-		return nil, err
+	if err := createPrevEventsTable(db); err != nil {
+		return err
 	}
-	membership, err := NewPostgresMembershipTable(db)
-	if err != nil {
-		return nil, err
+	if err := createRoomAliasesTable(db); err != nil {
+		return err
 	}
-	published, err := NewPostgresPublishedTable(db)
-	if err != nil {
-		return nil, err
+	if err := createInvitesTable(db); err != nil {
+		return err
 	}
-	redactions, err := NewPostgresRedactionsTable(db)
+	if err := createMembershipTable(db); err != nil {
+		return err
+	}
+	if err := createPublishedTable(db); err != nil {
+		return err
+	}
+	if err := createRedactionsTable(db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *Database) prepare(db *sql.DB, cache caching.RoomServerCaches) error {
+	eventStateKeys, err := prepareEventStateKeysTable(db)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	eventTypes, err := prepareEventTypesTable(db)
+	if err != nil {
+		return err
+	}
+	eventJSON, err := prepareEventJSONTable(db)
+	if err != nil {
+		return err
+	}
+	events, err := prepareEventsTable(db)
+	if err != nil {
+		return err
+	}
+	rooms, err := prepareRoomsTable(db)
+	if err != nil {
+		return err
+	}
+	transactions, err := prepareTransactionsTable(db)
+	if err != nil {
+		return err
+	}
+	stateBlock, err := prepareStateBlockTable(db)
+	if err != nil {
+		return err
+	}
+	stateSnapshot, err := prepareStateSnapshotTable(db)
+	if err != nil {
+		return err
+	}
+	prevEvents, err := preparePrevEventsTable(db)
+	if err != nil {
+		return err
+	}
+	roomAliases, err := prepareRoomAliasesTable(db)
+	if err != nil {
+		return err
+	}
+	invites, err := prepareInvitesTable(db)
+	if err != nil {
+		return err
+	}
+	membership, err := prepareMembershipTable(db)
+	if err != nil {
+		return err
+	}
+	published, err := preparePublishedTable(db)
+	if err != nil {
+		return err
+	}
+	redactions, err := prepareRedactionsTable(db)
+	if err != nil {
+		return err
 	}
 	d.Database = shared.Database{
 		DB:                  db,
@@ -116,5 +189,5 @@ func Open(dbProperties *config.DatabaseOptions, cache caching.RoomServerCaches) 
 		PublishedTable:      published,
 		RedactionsTable:     redactions,
 	}
-	return &d, nil
+	return nil
 }

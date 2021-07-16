@@ -26,11 +26,11 @@ import (
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/eduserver/cache"
 	"github.com/matrix-org/dendrite/federationsender"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
-	"github.com/matrix-org/dendrite/internal/setup"
 	"github.com/matrix-org/dendrite/keyserver"
 	"github.com/matrix-org/dendrite/roomserver"
+	"github.com/matrix-org/dendrite/setup"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/dendrite/userapi"
 	go_http_js_libp2p "github.com/matrix-org/go-http-js-libp2p"
 
@@ -139,16 +139,18 @@ func createFederationClient(cfg *config.Dendrite, node *go_http_js_libp2p.P2pLoc
 	tr := go_http_js_libp2p.NewP2pTransport(node)
 
 	fed := gomatrixserverlib.NewFederationClient(
-		cfg.Global.ServerName, cfg.Global.KeyID, cfg.Global.PrivateKey, true,
+		cfg.Global.ServerName, cfg.Global.KeyID, cfg.Global.PrivateKey,
+		gomatrixserverlib.WithTransport(tr),
 	)
-	fed.Client = *gomatrixserverlib.NewClientWithTransport(true, tr)
 
 	return fed
 }
 
 func createClient(node *go_http_js_libp2p.P2pLocalNode) *gomatrixserverlib.Client {
 	tr := go_http_js_libp2p.NewP2pTransport(node)
-	return gomatrixserverlib.NewClientWithTransport(true, tr)
+	return gomatrixserverlib.NewClient(
+		gomatrixserverlib.WithTransport(tr),
+	)
 }
 
 func createP2PNode(privKey ed25519.PrivateKey) (serverName string, node *go_http_js_libp2p.P2pLocalNode) {
@@ -190,7 +192,7 @@ func main() {
 
 	accountDB := base.CreateAccountsDB()
 	federation := createFederationClient(cfg, node)
-	keyAPI := keyserver.NewInternalAPI(&base.Cfg.KeyServer, federation, base.KafkaProducer)
+	keyAPI := keyserver.NewInternalAPI(&base.Cfg.KeyServer, federation)
 	userAPI := userapi.NewInternalAPI(accountDB, &cfg.UserAPI, nil, keyAPI)
 	keyAPI.SetUserAPI(userAPI)
 
@@ -207,18 +209,17 @@ func main() {
 	asQuery := appservice.NewInternalAPI(
 		base, userAPI, rsAPI,
 	)
-	fedSenderAPI := federationsender.NewInternalAPI(base, federation, rsAPI, &keyRing)
+	rsAPI.SetAppserviceAPI(asQuery)
+	fedSenderAPI := federationsender.NewInternalAPI(base, federation, rsAPI, &keyRing, true)
 	rsAPI.SetFederationSenderAPI(fedSenderAPI)
 	p2pPublicRoomProvider := NewLibP2PPublicRoomsProvider(node, fedSenderAPI, federation)
 
 	monolith := setup.Monolith{
-		Config:        base.Cfg,
-		AccountDB:     accountDB,
-		Client:        createClient(node),
-		FedClient:     federation,
-		KeyRing:       &keyRing,
-		KafkaConsumer: base.KafkaConsumer,
-		KafkaProducer: base.KafkaProducer,
+		Config:    base.Cfg,
+		AccountDB: accountDB,
+		Client:    createClient(node),
+		FedClient: federation,
+		KeyRing:   &keyRing,
 
 		AppserviceAPI:       asQuery,
 		EDUInternalAPI:      eduInputAPI,
@@ -230,10 +231,12 @@ func main() {
 		ExtPublicRoomsProvider: p2pPublicRoomProvider,
 	}
 	monolith.AddAllPublicRoutes(
+		base.ProcessContext,
 		base.PublicClientAPIMux,
 		base.PublicFederationAPIMux,
 		base.PublicKeyAPIMux,
 		base.PublicMediaAPIMux,
+		base.SynapseAdminMux,
 	)
 
 	httpRouter := mux.NewRouter().SkipClean(true).UseEncodedPath()

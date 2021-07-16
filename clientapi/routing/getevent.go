@@ -18,8 +18,8 @@ import (
 	"net/http"
 
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
@@ -32,7 +32,7 @@ type getEventRequest struct {
 	eventID        string
 	cfg            *config.ClientAPI
 	federation     *gomatrixserverlib.FederationClient
-	requestedEvent gomatrixserverlib.Event
+	requestedEvent *gomatrixserverlib.Event
 }
 
 // GetEvent implements GET /_matrix/client/r0/rooms/{roomId}/event/{eventId}
@@ -103,8 +103,22 @@ func GetEvent(
 		}
 	}
 
+	var appService *config.ApplicationService
+	if device.AppserviceID != "" {
+		for _, as := range cfg.Derived.ApplicationServices {
+			if as.ID == device.AppserviceID {
+				appService = &as
+				break
+			}
+		}
+	}
+
 	for _, stateEvent := range stateResp.StateEvents {
-		if !stateEvent.StateKeyEquals(device.UserID) {
+		if appService != nil {
+			if !appService.IsInterestedInUserID(*stateEvent.StateKey()) {
+				continue
+			}
+		} else if !stateEvent.StateKeyEquals(device.UserID) {
 			continue
 		}
 		membership, err := stateEvent.Membership()

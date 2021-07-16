@@ -4,15 +4,17 @@ import (
 	"context"
 
 	"github.com/Shopify/sarama"
+	"github.com/getsentry/sentry-go"
+	asAPI "github.com/matrix-org/dendrite/appservice/api"
 	fsAPI "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/caching"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/roomserver/acls"
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/dendrite/roomserver/internal/input"
 	"github.com/matrix-org/dendrite/roomserver/internal/perform"
 	"github.com/matrix-org/dendrite/roomserver/internal/query"
 	"github.com/matrix-org/dendrite/roomserver/storage"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrixserverlib"
 )
 
@@ -23,9 +25,12 @@ type RoomserverInternalAPI struct {
 	*perform.Inviter
 	*perform.Joiner
 	*perform.Peeker
+	*perform.InboundPeeker
+	*perform.Unpeeker
 	*perform.Leaver
 	*perform.Publisher
 	*perform.Backfiller
+	*perform.Forgetter
 	DB                     storage.Database
 	Cfg                    *config.RoomServer
 	Producer               sarama.SyncProducer
@@ -33,6 +38,7 @@ type RoomserverInternalAPI struct {
 	ServerName             gomatrixserverlib.ServerName
 	KeyRing                gomatrixserverlib.JSONVerifier
 	fsAPI                  fsAPI.FederationSenderInternalAPI
+	asAPI                  asAPI.AppServiceQueryAPI
 	OutputRoomEventTopic   string // Kafka topic for new output room events
 	PerspectiveServerNames []gomatrixserverlib.ServerName
 }
@@ -53,6 +59,7 @@ func NewRoomserverAPI(
 		Queryer: &query.Queryer{
 			DB:         roomserverDB,
 			Cache:      caches,
+			ServerName: cfg.Matrix.ServerName,
 			ServerACLs: serverACLs,
 		},
 		Inputer: &input.Inputer{
@@ -84,9 +91,22 @@ func (r *RoomserverInternalAPI) SetFederationSenderAPI(fsAPI fsAPI.FederationSen
 		Cfg:        r.Cfg,
 		DB:         r.DB,
 		FSAPI:      r.fsAPI,
+		RSAPI:      r,
 		Inputer:    r.Inputer,
+		Queryer:    r.Queryer,
 	}
 	r.Peeker = &perform.Peeker{
+		ServerName: r.Cfg.Matrix.ServerName,
+		Cfg:        r.Cfg,
+		DB:         r.DB,
+		FSAPI:      r.fsAPI,
+		Inputer:    r.Inputer,
+	}
+	r.InboundPeeker = &perform.InboundPeeker{
+		DB:      r.DB,
+		Inputer: r.Inputer,
+	}
+	r.Unpeeker = &perform.Unpeeker{
 		ServerName: r.Cfg.Matrix.ServerName,
 		Cfg:        r.Cfg,
 		DB:         r.DB,
@@ -112,6 +132,13 @@ func (r *RoomserverInternalAPI) SetFederationSenderAPI(fsAPI fsAPI.FederationSen
 		// than trying random servers
 		PreferServers: r.PerspectiveServerNames,
 	}
+	r.Forgetter = &perform.Forgetter{
+		DB: r.DB,
+	}
+}
+
+func (r *RoomserverInternalAPI) SetAppserviceAPI(asAPI asAPI.AppServiceQueryAPI) {
+	r.asAPI = asAPI
 }
 
 func (r *RoomserverInternalAPI) PerformInvite(
@@ -121,6 +148,7 @@ func (r *RoomserverInternalAPI) PerformInvite(
 ) error {
 	outputEvents, err := r.Inviter.PerformInvite(ctx, req, res)
 	if err != nil {
+		sentry.CaptureException(err)
 		return err
 	}
 	if len(outputEvents) == 0 {
@@ -136,10 +164,19 @@ func (r *RoomserverInternalAPI) PerformLeave(
 ) error {
 	outputEvents, err := r.Leaver.PerformLeave(ctx, req, res)
 	if err != nil {
+		sentry.CaptureException(err)
 		return err
 	}
 	if len(outputEvents) == 0 {
 		return nil
 	}
 	return r.WriteOutputEvents(req.RoomID, outputEvents)
+}
+
+func (r *RoomserverInternalAPI) PerformForget(
+	ctx context.Context,
+	req *api.PerformForgetRequest,
+	resp *api.PerformForgetResponse,
+) error {
+	return r.Forgetter.PerformForget(ctx, req, resp)
 }

@@ -23,8 +23,8 @@ import (
 
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
-	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 
 	"github.com/matrix-org/gomatrixserverlib"
@@ -65,7 +65,7 @@ func CreateInvitesFrom3PIDInvites(
 		return *reqErr
 	}
 
-	evs := []gomatrixserverlib.HeaderedEvent{}
+	evs := []*gomatrixserverlib.HeaderedEvent{}
 	for _, inv := range body.Invites {
 		verReq := api.QueryRoomVersionForRoomRequest{RoomID: inv.RoomID}
 		verRes := api.QueryRoomVersionForRoomResponse{}
@@ -84,12 +84,12 @@ func CreateInvitesFrom3PIDInvites(
 			return jsonerror.InternalServerError()
 		}
 		if event != nil {
-			evs = append(evs, (*event).Headered(verRes.RoomVersion))
+			evs = append(evs, event.Headered(verRes.RoomVersion))
 		}
 	}
 
 	// Send all the events
-	if err := api.SendEvents(req.Context(), rsAPI, evs, cfg.Matrix.ServerName, nil); err != nil {
+	if err := api.SendEvents(req.Context(), rsAPI, api.KindNew, evs, cfg.Matrix.ServerName, nil); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("SendEvents failed")
 		return jsonerror.InternalServerError()
 	}
@@ -165,7 +165,7 @@ func ExchangeThirdPartyInvite(
 
 	// Ask the requesting server to sign the newly created event so we know it
 	// acknowledged it
-	signedEvent, err := federation.SendInvite(httpReq.Context(), request.Origin(), *event)
+	signedEvent, err := federation.SendInvite(httpReq.Context(), request.Origin(), event)
 	if err != nil {
 		util.GetLogger(httpReq.Context()).WithError(err).Error("federation.SendInvite failed")
 		return jsonerror.InternalServerError()
@@ -174,7 +174,8 @@ func ExchangeThirdPartyInvite(
 	// Send the event to the roomserver
 	if err = api.SendEvents(
 		httpReq.Context(), rsAPI,
-		[]gomatrixserverlib.HeaderedEvent{
+		api.KindNew,
+		[]*gomatrixserverlib.HeaderedEvent{
 			signedEvent.Event.Headered(verRes.RoomVersion),
 		},
 		cfg.Matrix.ServerName,
@@ -296,7 +297,7 @@ func buildMembershipEvent(
 	authEvents := gomatrixserverlib.NewAuthEvents(nil)
 
 	for i := range queryRes.StateEvents {
-		err = authEvents.AddEvent(&queryRes.StateEvents[i].Event)
+		err = authEvents.AddEvent(queryRes.StateEvents[i].Event)
 		if err != nil {
 			return nil, err
 		}
@@ -317,7 +318,7 @@ func buildMembershipEvent(
 		cfg.Matrix.PrivateKey, queryRes.RoomVersion,
 	)
 
-	return &event, err
+	return event, err
 }
 
 // sendToRemoteServer uses federation to send an invite provided by an identity

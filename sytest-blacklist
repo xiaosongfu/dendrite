@@ -58,3 +58,22 @@ The only membership state included in a gapped incremental sync is for senders i
 Invited user can reject local invite after originator leaves
 Invited user can reject invite for empty room
 If user leaves room, remote user changes device and rejoins we see update in /sync and /keys/changes
+
+# Blacklisted due to flakiness
+A prev_batch token from incremental sync can be used in the v1 messages API
+
+# Blacklisted due to flakiness
+Forgotten room messages cannot be paginated
+
+# Blacklisted due to flakiness
+Can re-join room if re-invited
+
+# Blacklisted due to flakiness after #1774
+Local device key changes get to remote servers with correct prev_id
+
+# Flakey
+Local device key changes appear in /keys/changes
+
+# we don't support groups
+Remove group category
+Remove group role

@@ -39,7 +39,8 @@ CREATE INDEX IF NOT EXISTS roomserver_redactions_redacts_event_id ON roomserver_
 
 const insertRedactionSQL = "" +
 	"INSERT INTO roomserver_redactions (redaction_event_id, redacts_event_id, validated)" +
-	" VALUES ($1, $2, $3)"
+	" VALUES ($1, $2, $3)" +
+	" ON CONFLICT DO NOTHING"
 
 const selectRedactionInfoByRedactionEventIDSQL = "" +
 	"SELECT redaction_event_id, redacts_event_id, validated FROM roomserver_redactions" +
@@ -59,12 +60,13 @@ type redactionStatements struct {
 	markRedactionValidatedStmt                  *sql.Stmt
 }
 
-func NewPostgresRedactionsTable(db *sql.DB) (tables.Redactions, error) {
-	s := &redactionStatements{}
+func createRedactionsTable(db *sql.DB) error {
 	_, err := db.Exec(redactionsSchema)
-	if err != nil {
-		return nil, err
-	}
+	return err
+}
+
+func prepareRedactionsTable(db *sql.DB) (tables.Redactions, error) {
+	s := &redactionStatements{}
 
 	return s, shared.StatementList{
 		{&s.insertRedactionStmt, insertRedactionSQL},

@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS roomserver_redactions (
 `
 
 const insertRedactionSQL = "" +
-	"INSERT INTO roomserver_redactions (redaction_event_id, redacts_event_id, validated)" +
+	"INSERT OR IGNORE INTO roomserver_redactions (redaction_event_id, redacts_event_id, validated)" +
 	" VALUES ($1, $2, $3)"
 
 const selectRedactionInfoByRedactionEventIDSQL = "" +
@@ -59,13 +59,14 @@ type redactionStatements struct {
 	markRedactionValidatedStmt                  *sql.Stmt
 }
 
-func NewSqliteRedactionsTable(db *sql.DB) (tables.Redactions, error) {
+func createRedactionsTable(db *sql.DB) error {
+	_, err := db.Exec(redactionsSchema)
+	return err
+}
+
+func prepareRedactionsTable(db *sql.DB) (tables.Redactions, error) {
 	s := &redactionStatements{
 		db: db,
-	}
-	_, err := db.Exec(redactionsSchema)
-	if err != nil {
-		return nil, err
 	}
 
 	return s, shared.StatementList{

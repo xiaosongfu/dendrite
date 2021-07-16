@@ -21,8 +21,10 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/matrix-org/dendrite/federationsender/storage/shared"
-	"github.com/matrix-org/dendrite/internal/config"
+	"github.com/matrix-org/dendrite/federationsender/storage/sqlite3/deltas"
+	"github.com/matrix-org/dendrite/internal/caching"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
+	"github.com/matrix-org/dendrite/setup/config"
 )
 
 // Database stores information needed by the federation sender
@@ -34,7 +36,7 @@ type Database struct {
 }
 
 // NewDatabase opens a new database
-func NewDatabase(dbProperties *config.DatabaseOptions) (*Database, error) {
+func NewDatabase(dbProperties *config.DatabaseOptions, cache caching.FederationSenderCache) (*Database, error) {
 	var d Database
 	var err error
 	if d.db, err = sqlutil.Open(dbProperties); err != nil {
@@ -42,10 +44,6 @@ func NewDatabase(dbProperties *config.DatabaseOptions) (*Database, error) {
 	}
 	d.writer = sqlutil.NewExclusiveWriter()
 	joinedHosts, err := NewSQLiteJoinedHostsTable(d.db)
-	if err != nil {
-		return nil, err
-	}
-	rooms, err := NewSQLiteRoomsTable(d.db)
 	if err != nil {
 		return nil, err
 	}
@@ -65,15 +63,40 @@ func NewDatabase(dbProperties *config.DatabaseOptions) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
+	outboundPeeks, err := NewSQLiteOutboundPeeksTable(d.db)
+	if err != nil {
+		return nil, err
+	}
+	inboundPeeks, err := NewSQLiteInboundPeeksTable(d.db)
+	if err != nil {
+		return nil, err
+	}
+	notaryKeys, err := NewSQLiteNotaryServerKeysTable(d.db)
+	if err != nil {
+		return nil, err
+	}
+	notaryKeysMetadata, err := NewSQLiteNotaryServerKeysMetadataTable(d.db)
+	if err != nil {
+		return nil, err
+	}
+	m := sqlutil.NewMigrations()
+	deltas.LoadRemoveRoomsTable(m)
+	if err = m.RunDeltas(d.db, dbProperties); err != nil {
+		return nil, err
+	}
 	d.Database = shared.Database{
-		DB:                          d.db,
-		Writer:                      d.writer,
-		FederationSenderJoinedHosts: joinedHosts,
-		FederationSenderQueuePDUs:   queuePDUs,
-		FederationSenderQueueEDUs:   queueEDUs,
-		FederationSenderQueueJSON:   queueJSON,
-		FederationSenderRooms:       rooms,
-		FederationSenderBlacklist:   blacklist,
+		DB:                            d.db,
+		Cache:                         cache,
+		Writer:                        d.writer,
+		FederationSenderJoinedHosts:   joinedHosts,
+		FederationSenderQueuePDUs:     queuePDUs,
+		FederationSenderQueueEDUs:     queueEDUs,
+		FederationSenderQueueJSON:     queueJSON,
+		FederationSenderBlacklist:     blacklist,
+		FederationSenderOutboundPeeks: outboundPeeks,
+		FederationSenderInboundPeeks:  inboundPeeks,
+		NotaryServerKeysJSON:          notaryKeys,
+		NotaryServerKeysMetadata:      notaryKeysMetadata,
 	}
 	if err = d.PartitionOffsetStatements.Prepare(d.db, d.writer, "federationsender"); err != nil {
 		return nil, err

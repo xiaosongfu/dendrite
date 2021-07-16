@@ -20,8 +20,8 @@ import (
 
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
-	"github.com/matrix-org/dendrite/internal/config"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/setup/config"
 	"github.com/matrix-org/gomatrix"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
@@ -53,9 +53,12 @@ func RoomAliasToID(
 	var resp gomatrixserverlib.RespDirectory
 
 	if domain == cfg.Matrix.ServerName {
-		queryReq := roomserverAPI.GetRoomIDForAliasRequest{Alias: roomAlias}
-		var queryRes roomserverAPI.GetRoomIDForAliasResponse
-		if err = rsAPI.GetRoomIDForAlias(httpReq.Context(), &queryReq, &queryRes); err != nil {
+		queryReq := &roomserverAPI.GetRoomIDForAliasRequest{
+			Alias:              roomAlias,
+			IncludeAppservices: true,
+		}
+		queryRes := &roomserverAPI.GetRoomIDForAliasResponse{}
+		if err = rsAPI.GetRoomIDForAlias(httpReq.Context(), queryReq, queryRes); err != nil {
 			util.GetLogger(httpReq.Context()).WithError(err).Error("aliasAPI.GetRoomIDForAlias failed")
 			return jsonerror.InternalServerError()
 		}

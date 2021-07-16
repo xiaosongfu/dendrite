@@ -17,7 +17,6 @@
 package input
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 
@@ -28,7 +27,6 @@ import (
 	"github.com/matrix-org/dendrite/roomserver/types"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
-	"github.com/sirupsen/logrus"
 )
 
 // updateLatestEvents updates the list of latest events for this room in the database and writes the
@@ -52,7 +50,7 @@ func (r *Inputer) updateLatestEvents(
 	ctx context.Context,
 	roomInfo *types.RoomInfo,
 	stateAtEvent types.StateAtEvent,
-	event gomatrixserverlib.Event,
+	event *gomatrixserverlib.Event,
 	sendAsServer string,
 	transactionID *api.TransactionID,
 	rewritesState bool,
@@ -94,7 +92,7 @@ type latestEventsUpdater struct {
 	updater       *shared.LatestEventsUpdater
 	roomInfo      *types.RoomInfo
 	stateAtEvent  types.StateAtEvent
-	event         gomatrixserverlib.Event
+	event         *gomatrixserverlib.Event
 	transactionID *api.TransactionID
 	rewritesState bool
 	// Which server to send this event as.
@@ -102,7 +100,8 @@ type latestEventsUpdater struct {
 	// The eventID of the event that was processed before this one.
 	lastEventIDSent string
 	// The latest events in the room after processing this event.
-	latest []types.StateAtEventAndReference
+	oldLatest []types.StateAtEventAndReference
+	latest    []types.StateAtEventAndReference
 	// The state entries removed from and added to the current state of the
 	// room as a result of processing this event. They are sorted lists.
 	removed []types.StateEntry
@@ -118,7 +117,6 @@ type latestEventsUpdater struct {
 
 func (u *latestEventsUpdater) doUpdateLatestEvents() error {
 	u.lastEventIDSent = u.updater.LastEventIDSent()
-	u.oldStateNID = u.updater.CurrentStateSnapshotNID()
 
 	// If we are doing a regular event update then we will get the
 	// previous latest events to use as a part of the calculation. If
@@ -126,15 +124,15 @@ func (u *latestEventsUpdater) doUpdateLatestEvents() error {
 	// state snapshot from somewhere else, e.g. a federated room join,
 	// then start with an empty set - none of the forward extremities
 	// that we knew about before matter anymore.
-	oldLatest := []types.StateAtEventAndReference{}
-	if !u.stateAtEvent.Overwrite {
-		oldLatest = u.updater.LatestEvents()
+	u.oldLatest = []types.StateAtEventAndReference{}
+	if !u.rewritesState {
+		u.oldStateNID = u.updater.CurrentStateSnapshotNID()
+		u.oldLatest = u.updater.LatestEvents()
 	}
 
 	// If the event has already been written to the output log then we
 	// don't need to do anything, as we've handled it already.
-	hasBeenSent, err := u.updater.HasEventBeenSent(u.stateAtEvent.EventNID)
-	if err != nil {
+	if hasBeenSent, err := u.updater.HasEventBeenSent(u.stateAtEvent.EventNID); err != nil {
 		return fmt.Errorf("u.updater.HasEventBeenSent: %w", err)
 	} else if hasBeenSent {
 		return nil
@@ -142,29 +140,35 @@ func (u *latestEventsUpdater) doUpdateLatestEvents() error {
 
 	// Work out what the latest events are. This will include the new
 	// event if it is not already referenced.
-	u.calculateLatest(
-		oldLatest,
+	extremitiesChanged, err := u.calculateLatest(
+		u.oldLatest, u.event,
 		types.StateAtEventAndReference{
 			EventReference: u.event.EventReference(),
 			StateAtEvent:   u.stateAtEvent,
 		},
 	)
+	if err != nil {
+		return fmt.Errorf("u.calculateLatest: %w", err)
+	}
 
 	// Now that we know what the latest events are, it's time to get the
 	// latest state.
-	if err = u.latestState(); err != nil {
-		return fmt.Errorf("u.latestState: %w", err)
+	var updates []api.OutputEvent
+	if extremitiesChanged || u.rewritesState {
+		if err = u.latestState(); err != nil {
+			return fmt.Errorf("u.latestState: %w", err)
+		}
+
+		// If we need to generate any output events then here's where we do it.
+		// TODO: Move this!
+		if updates, err = u.api.updateMemberships(u.ctx, u.updater, u.removed, u.added); err != nil {
+			return fmt.Errorf("u.api.updateMemberships: %w", err)
+		}
+	} else {
+		u.newStateNID = u.oldStateNID
 	}
 
-	// If we need to generate any output events then here's where we do it.
-	// TODO: Move this!
-	updates, err := u.api.updateMemberships(u.ctx, u.updater, u.removed, u.added)
-	if err != nil {
-		return fmt.Errorf("u.api.updateMemberships: %w", err)
-	}
-
-	var update *api.OutputEvent
-	update, err = u.makeOutputNewRoomEvent()
+	update, err := u.makeOutputNewRoomEvent()
 	if err != nil {
 		return fmt.Errorf("u.makeOutputNewRoomEvent: %w", err)
 	}
@@ -196,6 +200,37 @@ func (u *latestEventsUpdater) doUpdateLatestEvents() error {
 func (u *latestEventsUpdater) latestState() error {
 	var err error
 	roomState := state.NewStateResolution(u.api.DB, *u.roomInfo)
+
+	// Work out if the state at the extremities has actually changed
+	// or not. If they haven't then we won't bother doing all of the
+	// hard work.
+	if u.event.StateKey() == nil {
+		stateChanged := false
+		oldStateNIDs := make([]types.StateSnapshotNID, 0, len(u.oldLatest))
+		newStateNIDs := make([]types.StateSnapshotNID, 0, len(u.latest))
+		for _, old := range u.oldLatest {
+			oldStateNIDs = append(oldStateNIDs, old.BeforeStateSnapshotNID)
+		}
+		for _, new := range u.latest {
+			newStateNIDs = append(newStateNIDs, new.BeforeStateSnapshotNID)
+		}
+		oldStateNIDs = state.UniqueStateSnapshotNIDs(oldStateNIDs)
+		newStateNIDs = state.UniqueStateSnapshotNIDs(newStateNIDs)
+		if len(oldStateNIDs) != len(newStateNIDs) {
+			stateChanged = true
+		} else {
+			for i := range oldStateNIDs {
+				if oldStateNIDs[i] != newStateNIDs[i] {
+					stateChanged = true
+					break
+				}
+			}
+		}
+		if !stateChanged {
+			u.newStateNID = u.oldStateNID
+			return nil
+		}
+	}
 
 	// Get a list of the current latest events. This may or may not
 	// include the new event from the input path, depending on whether
@@ -233,18 +268,6 @@ func (u *latestEventsUpdater) latestState() error {
 	if err != nil {
 		return fmt.Errorf("roomState.DifferenceBetweenStateSnapshots: %w", err)
 	}
-	if len(u.removed) > len(u.added) {
-		// This really shouldn't happen.
-		// TODO: What is ultimately the best way to handle this situation?
-		logrus.Errorf(
-			"Invalid state delta on event %q wants to remove %d state but only add %d state (between state snapshots %d and %d)",
-			u.event.EventID(), len(u.removed), len(u.added), u.oldStateNID, u.newStateNID,
-		)
-		u.added = u.added[:0]
-		u.removed = u.removed[:0]
-		u.newStateNID = u.oldStateNID
-		return nil
-	}
 
 	// Also work out the state before the event removes and the event
 	// adds.
@@ -258,53 +281,78 @@ func (u *latestEventsUpdater) latestState() error {
 	return nil
 }
 
+// calculateLatest works out the new set of forward extremities. Returns
+// true if the new event is included in those extremites, false otherwise.
 func (u *latestEventsUpdater) calculateLatest(
 	oldLatest []types.StateAtEventAndReference,
-	newEvent types.StateAtEventAndReference,
-) {
-	var newLatest []types.StateAtEventAndReference
+	newEvent *gomatrixserverlib.Event,
+	newStateAndRef types.StateAtEventAndReference,
+) (bool, error) {
+	// First of all, get a list of all of the events in our current
+	// set of forward extremities.
+	existingRefs := make(map[string]*types.StateAtEventAndReference)
+	for i, old := range oldLatest {
+		existingRefs[old.EventID] = &oldLatest[i]
+	}
 
-	// First of all, let's see if any of the existing forward extremities
-	// now have entries in the previous events table. If they do then we
+	// If the "new" event is already a forward extremity then stop, as
+	// nothing changes.
+	if _, ok := existingRefs[newEvent.EventID()]; ok {
+		u.latest = oldLatest
+		return false, nil
+	}
+
+	// If the "new" event is already referenced by an existing event
+	// then do nothing - it's not a candidate to be a new extremity if
+	// it has been referenced.
+	if referenced, err := u.updater.IsReferenced(newEvent.EventReference()); err != nil {
+		return false, fmt.Errorf("u.updater.IsReferenced(new): %w", err)
+	} else if referenced {
+		u.latest = oldLatest
+		return false, nil
+	}
+
+	// Then let's see if any of the existing forward extremities now
+	// have entries in the previous events table. If they do then we
 	// will no longer include them as forward extremities.
-	for _, l := range oldLatest {
+	existingPrevs := make(map[string]struct{})
+	for _, l := range existingRefs {
 		referenced, err := u.updater.IsReferenced(l.EventReference)
 		if err != nil {
-			logrus.WithError(err).Errorf("Failed to retrieve event reference for %q", l.EventID)
-		} else if !referenced {
-			newLatest = append(newLatest, l)
+			return false, fmt.Errorf("u.updater.IsReferenced: %w", err)
+		} else if referenced {
+			existingPrevs[l.EventID] = struct{}{}
 		}
 	}
 
-	// Then check and see if our new event is already included in that set.
-	// This ordinarily won't happen but it covers the edge-case that we've
-	// already seen this event before and it's a forward extremity, so rather
-	// than adding a duplicate, we'll just return the set as complete.
-	for _, l := range newLatest {
-		if l.EventReference.EventID == newEvent.EventReference.EventID && bytes.Equal(l.EventReference.EventSHA256, newEvent.EventReference.EventSHA256) {
-			// We've already referenced this new event so we can just return
-			// the newly completed extremities at this point.
-			u.latest = newLatest
-			return
-		}
+	// Include our new event in the extremities.
+	newLatest := []types.StateAtEventAndReference{newStateAndRef}
+
+	// Then run through and see if the other extremities are still valid.
+	// If our new event references them then they are no longer good
+	// candidates.
+	for _, prevEventID := range newEvent.PrevEventIDs() {
+		delete(existingRefs, prevEventID)
 	}
 
-	// At this point we've processed the old extremities, and we've checked
-	// that our new event isn't already in that set. Therefore now we can
-	// check if our *new* event is a forward extremity, and if it is, add
-	// it in.
-	referenced, err := u.updater.IsReferenced(newEvent.EventReference)
-	if err != nil {
-		logrus.WithError(err).Errorf("Failed to retrieve event reference for %q", newEvent.EventReference.EventID)
-	} else if !referenced || len(newLatest) == 0 {
-		newLatest = append(newLatest, newEvent)
+	// Ensure that we don't add any candidate forward extremities from
+	// the old set that are, themselves, referenced by the old set of
+	// forward extremities. This shouldn't happen but guards against
+	// the possibility anyway.
+	for prevEventID := range existingPrevs {
+		delete(existingRefs, prevEventID)
+	}
+
+	// Then re-add any old extremities that are still valid after all.
+	for _, old := range existingRefs {
+		newLatest = append(newLatest, *old)
 	}
 
 	u.latest = newLatest
+	return true, nil
 }
 
 func (u *latestEventsUpdater) makeOutputNewRoomEvent() (*api.OutputEvent, error) {
-
 	latestEventIDs := make([]string, len(u.latest))
 	for i := range u.latest {
 		latestEventIDs[i] = u.latest[i].EventID
@@ -322,7 +370,6 @@ func (u *latestEventsUpdater) makeOutputNewRoomEvent() (*api.OutputEvent, error)
 	if err != nil {
 		return nil, err
 	}
-
 	for _, entry := range u.added {
 		ore.AddsStateEventIDs = append(ore.AddsStateEventIDs, eventIDMap[entry.EventNID])
 	}
@@ -335,21 +382,17 @@ func (u *latestEventsUpdater) makeOutputNewRoomEvent() (*api.OutputEvent, error)
 	for _, entry := range u.stateBeforeEventAdds {
 		ore.StateBeforeAddsEventIDs = append(ore.StateBeforeAddsEventIDs, eventIDMap[entry.EventNID])
 	}
+
 	ore.SendAsServer = u.sendAsServer
 
 	// include extra state events if they were added as nearly every downstream component will care about it
 	// and we'd rather not have them all hit QueryEventsByID at the same time!
 	if len(ore.AddsStateEventIDs) > 0 {
-		ore.AddStateEvents, err = u.extraEventsForIDs(u.roomInfo.RoomVersion, ore.AddsStateEventIDs)
-		if err != nil {
+		var err error
+		if ore.AddStateEvents, err = u.extraEventsForIDs(u.roomInfo.RoomVersion, ore.AddsStateEventIDs); err != nil {
 			return nil, fmt.Errorf("failed to load add_state_events from db: %w", err)
 		}
 	}
-	// State is rewritten if the input room event HasState and we actually produced a delta on state events.
-	// Without this check, /get_missing_events which produce events with associated (but not complete) state
-	// will incorrectly purge the room and set it to no state. TODO: This is likely flakey, as if /gme produced
-	// a state conflict res which just so happens to include 2+ events we might purge the room state downstream.
-	ore.RewritesState = len(ore.AddsStateEventIDs) > 1
 
 	return &api.OutputEvent{
 		Type:         api.OutputTypeNewRoomEvent,
@@ -359,7 +402,7 @@ func (u *latestEventsUpdater) makeOutputNewRoomEvent() (*api.OutputEvent, error)
 
 // extraEventsForIDs returns the full events for the event IDs given, but does not include the current event being
 // updated.
-func (u *latestEventsUpdater) extraEventsForIDs(roomVersion gomatrixserverlib.RoomVersion, eventIDs []string) ([]gomatrixserverlib.HeaderedEvent, error) {
+func (u *latestEventsUpdater) extraEventsForIDs(roomVersion gomatrixserverlib.RoomVersion, eventIDs []string) ([]*gomatrixserverlib.HeaderedEvent, error) {
 	var extraEventIDs []string
 	for _, e := range eventIDs {
 		if e == u.event.EventID() {
@@ -374,7 +417,7 @@ func (u *latestEventsUpdater) extraEventsForIDs(roomVersion gomatrixserverlib.Ro
 	if err != nil {
 		return nil, err
 	}
-	var h []gomatrixserverlib.HeaderedEvent
+	var h []*gomatrixserverlib.HeaderedEvent
 	for _, e := range extraEvents {
 		h = append(h, e.Headered(roomVersion))
 	}
